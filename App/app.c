@@ -29,6 +29,9 @@
 #include "foc_math.h"
 #include "motor_params.h"
 #endif
+#if BRINGUP_STAGE >= 2
+#include "aux_sense.h"
+#endif
 #if COMMS_TEST
 #include "comms_test.h"
 #endif
@@ -1665,6 +1668,20 @@ static void test_tick(uint32_t now_ms)
 
 /* ---- Entry points --------------------------------------------------------- */
 
+/* CRS_CR TRIM is 7 bits with its centre and reset value at 64 (RM0440 8.7.1;
+ * HAL RCC_CRS_HSI48CALIBRATION_DEFAULT). CubeMX only offers 0-63 and writes
+ * 32, about 32 x 0.14 % = 4.5 % slow (DS13122 Table 43): too far off for USB
+ * to decode the SOF the CRS needs to correct it (Bring-up log 2026-10-14).
+ * TRIM is read-only while AUTOTRIMEN is set, so pause auto-trimming. */
+#define APP_HSI48_TRIM_CENTRE   64U
+
+void app_clock_init(void)
+{
+  CLEAR_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
+  MODIFY_REG(CRS->CR, CRS_CR_TRIM, APP_HSI48_TRIM_CENTRE << CRS_CR_TRIM_Pos);
+  SET_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
+}
+
 void app_init(void)
 {
   /* Safe pins first, before anything is logged. */
@@ -1698,6 +1715,10 @@ void app_init(void)
   bool pwr_ok = power_init();
   debug_log("PWR adc1 cal+enable %s en=%u vm_mv=%lu", pwr_ok ? "OK" : "FAIL",
             power_motor_en() ? 1U : 0U, power_vm_mv());
+  /* After power_init() (ADC1 enabled), before cursense_init() (injected
+   * conversions armed: sampling times can't be changed after). */
+  debug_log("AUX thr1 PA0/ADC2_IN1 thr2 PA1/ADC2_IN2 isup PB12/ADC1_IN11 smp 47.5 %s",
+            aux_sense_init() ? "OK" : "FAIL (ADC busy)");
 #endif
 #if BRINGUP_STAGE == 2
   /* Start from the current SW1 level, so booting with SW1 already on
@@ -1772,6 +1793,7 @@ void app_loop(void)
 #endif
 #if BRINGUP_STAGE >= 2
     power_tick(s_last_tick_ms);
+    aux_sense_tick(s_last_tick_ms);
 #endif
 #if BRINGUP_STAGE >= 3
     drv_tick();

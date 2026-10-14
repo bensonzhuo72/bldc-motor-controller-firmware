@@ -5,6 +5,10 @@
 #ifndef APP_H
 #define APP_H
 
+/** Once, after SystemClock_Config and before the peripheral init
+ *  (main.c USER CODE SysInit): clock corrections CubeMX can't express. */
+void app_clock_init(void);
+
 /** Once, after the CubeMX peripheral init (main.c USER CODE 2). */
 void app_init(void);
 

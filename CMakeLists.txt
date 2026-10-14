@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/ctrl.c
     App/foc_math.c
     App/comms_test.c
+    App/aux_sense.c
 )
 
 # The 20 kHz control interrupt path is built optimised even in Debug: at -O0

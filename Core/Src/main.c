@@ -90,6 +90,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  app_clock_init();
 
   /* USER CODE END SysInit */
 

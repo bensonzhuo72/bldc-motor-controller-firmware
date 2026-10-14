@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "debug.h"
+#include "app_config.h"
+#include "comms_test.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -193,6 +195,9 @@ void SysTick_Handler(void)
 void USB_LP_IRQHandler(void)
 {
   /* USER CODE BEGIN USB_LP_IRQn 0 */
+#if COMMS_TEST
+  comms_test_usb_irq();
+#endif
 
   /* USER CODE END USB_LP_IRQn 0 */
   HAL_PCD_IRQHandler(&hpcd_USB_FS);

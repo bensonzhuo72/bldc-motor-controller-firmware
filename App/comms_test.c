@@ -3,6 +3,7 @@
  * @brief   I2C / UART / CAN / USB bench test. See comms_test.h.
  */
 #include "comms_test.h"
+#include "app_config.h"
 #include "debug.h"
 #include "i2c.h"
 #include "usart.h"
@@ -38,7 +39,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* ---- UART: USART2, 115200 8N1 (CubeMX) -------------------------------------- */
 
-#define UART_TX_PERIOD_MS       500U
+#define UART_TX_PERIOD_MS       100U    /* was 500; faster for scoping (2026-10-14) */
 #define UART_BUF                64U     /* one received burst (up to an idle line) */
 #define UART_TX_BUF             96U
 
@@ -49,6 +50,20 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define CAN_REPLY_ID            0x201U  /* ...and we answer with the same data */
 #define CAN_TX_PERIOD_MS        100U
 #define CAN_RX_QUEUE            8U      /* power of two */
+
+/* Loopback self-test (RM0440 FDCAN loop-back modes). Selected from the
+ * debugger with g_can_mode: 0 normal, 1 internal loopback (all inside the
+ * chip: TX pin held recessive, RX pin disconnected), 2 external loopback
+ * (frames driven on PB6 and onto the bus, fed back internally; the RX pin
+ * and missing ACKs are ignored). In loopback a request frame on 0x200 is
+ * also sent every second, so the 0x200 -> 0x201 reply path is exercised;
+ * each returned frame is checked against what was sent. */
+#define CAN_MODE_NORMAL         0U
+#define CAN_MODE_INT_LOOPBACK   1U
+#define CAN_MODE_EXT_LOOPBACK   2U
+#define CAN_LB_REQ_PERIOD_MS    1000U
+#define CAN_LB_PATTERN0         0xA5U
+#define CAN_LB_PATTERN1         0x5AU
 
 /* ---- USB CDC -------------------------------------------------------------- */
 
@@ -89,12 +104,29 @@ static uint32_t s_can_tx_count;
 static uint32_t s_can_tx_full;
 static bool     s_can_ok;
 
+volatile uint32_t g_can_mode = CAN_MODE_NORMAL;   /* set from the debugger */
+static uint32_t s_can_mode = CAN_MODE_NORMAL;      /* mode running */
+static uint32_t s_lb_req_count;                    /* loopback: 0x200 requests sent */
+static uint32_t s_lb_ok;                           /* frames returned intact */
+static uint32_t s_lb_bad;                          /* frames returned with wrong content */
+static uint32_t s_last_101_count = 0xFFFFFFFFU;    /* counter in our last 0x101 */
+
 static uint8_t  s_usb_rx[USB_BUF];
 static volatile uint32_t s_usb_rx_len;     /* 0 = nothing pending */
 static volatile uint32_t s_usb_rx_bytes;
 static char     s_usb_tx[USB_BUF + 16U];
 static uint32_t s_usb_tx_count;
 static uint8_t  s_usb_state;
+/* Enumeration diagnostics: USB interrupt causes, counted in comms_test_usb_irq()
+ * before the HAL clears them (USB_ISTR, RM0440 46.6.1). */
+static volatile uint32_t s_usb_irq;
+static volatile uint32_t s_usb_irq_reset;
+static volatile uint32_t s_usb_irq_sof;
+static volatile uint32_t s_usb_irq_err;     /* bit stuffing, CRC, timeout: bad signal or clock */
+static volatile uint32_t s_usb_irq_ctr;     /* a transfer completed (setup, data in or out) */
+static volatile uint32_t s_usb_irq_susp;
+static USBD_SetupReqTypedef s_usb_last_req;
+static uint8_t  s_usb_last_addr;
 
 /* ---- Helpers -------------------------------------------------------------- */
 
@@ -342,31 +374,100 @@ static bool can_send(uint32_t id, const uint8_t *data, uint32_t len)
   return true;
 }
 
-static void can_init(void)
+static const char *can_mode_name(uint32_t mode)
 {
+  return (mode == CAN_MODE_INT_LOOPBACK) ? "internal loopback" :
+         ((mode == CAN_MODE_EXT_LOOPBACK) ? "external loopback" : "normal");
+}
+
+/* (Re)start FDCAN2 in the given mode: stop, re-init with the CubeMX bit
+ * timing and the new mode (HAL_FDCAN_Init from READY skips the MSP), then
+ * filter, notification, start. */
+static void can_start(uint32_t mode)
+{
+  static const uint32_t hal_mode[3] =
+  {
+    FDCAN_MODE_NORMAL, FDCAN_MODE_INTERNAL_LOOPBACK, FDCAN_MODE_EXTERNAL_LOOPBACK
+  };
+  (void)HAL_FDCAN_Stop(&hfdcan2);   /* harmless if not started */
+  hfdcan2.Init.Mode = hal_mode[mode];
   /* No filters configured: accept every standard and extended data frame
    * into RX FIFO 0, reject remote frames. */
-  s_can_ok = (HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_ACCEPT_IN_RX_FIFO0,
+  s_can_ok = (HAL_FDCAN_Init(&hfdcan2) == HAL_OK) &&
+             (HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_ACCEPT_IN_RX_FIFO0,
                                            FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) == HAL_OK) &&
              (HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0U) == HAL_OK) &&
              (HAL_FDCAN_Start(&hfdcan2) == HAL_OK);
-  debug_log("CAN fdcan2 classic 500k: %s; tx id 0x%03X every %u ms, rx all, 0x%03X -> reply 0x%03X",
-            s_can_ok ? "started" : "FAIL", CAN_TX_ID, CAN_TX_PERIOD_MS, CAN_REQ_ID, CAN_REPLY_ID);
+  s_can_mode = mode;
+  s_last_101_count = 0xFFFFFFFFU;
+  debug_log("CAN fdcan2 classic 500k %s: %s; tx 0x%03X every %u ms, rx all, 0x%03X -> 0x%03X",
+            can_mode_name(mode), s_can_ok ? "started" : "FAIL", CAN_TX_ID, CAN_TX_PERIOD_MS,
+            CAN_REQ_ID, CAN_REPLY_ID);
+}
+
+static void can_init(void)
+{
+  can_start(CAN_MODE_NORMAL);
+  debug_log("CAN self-test: set g_can_mode = 1 (internal loopback), 2 (external), 0 (normal)");
+}
+
+/* Loopback: check a frame we sent came back intact. 0x101 carries the
+ * counter of the last one sent; 0x200/0x201 carry the A5 5A pattern. */
+static void can_check_loopback(const can_frame_t *f)
+{
+  bool ok;
+  if (f->id == CAN_TX_ID)
+  {
+    uint32_t n;
+    memcpy(&n, &f->data[0], 4U);
+    ok = (f->len == 8U) && (n == s_last_101_count);
+  }
+  else if ((f->id == CAN_REQ_ID) || (f->id == CAN_REPLY_ID))
+  {
+    ok = (f->len == 8U) && (f->data[0] == CAN_LB_PATTERN0) && (f->data[1] == CAN_LB_PATTERN1);
+  }
+  else
+  {
+    return;   /* not ours */
+  }
+  if (ok)
+  {
+    s_lb_ok++;
+  }
+  else
+  {
+    s_lb_bad++;
+    debug_log("CAN loopback MISMATCH id=0x%03lX len=%lu", f->id, f->len);
+  }
 }
 
 static void can_tick(uint32_t now_ms)
 {
+  uint32_t want = g_can_mode;
+  if ((want != s_can_mode) && (want <= CAN_MODE_EXT_LOOPBACK))
+  {
+    can_start(want);
+  }
+  bool loopback = (s_can_mode != CAN_MODE_NORMAL);
+
   while (s_can_tail != s_can_head)
   {
     const can_frame_t *f = &s_can_q[s_can_tail & (CAN_RX_QUEUE - 1U)];
-    char hex[3U * 8U + 1U];
-    uint32_t j = 0U;
-    for (uint32_t i = 0U; i < f->len; i++)
+    if (loopback)
     {
-      j += (uint32_t)snprintf(&hex[j], sizeof(hex) - j, "%02X ", f->data[i]);
+      can_check_loopback(f);
     }
-    hex[j] = '\0';
-    debug_log("CAN rx id=0x%03lX len=%lu data=%s", f->id, f->len, hex);
+    if (!loopback || (f->id != CAN_TX_ID))   /* our own 0x101 echoes are only counted */
+    {
+      char hex[3U * 8U + 1U];
+      uint32_t j = 0U;
+      for (uint32_t i = 0U; i < f->len; i++)
+      {
+        j += (uint32_t)snprintf(&hex[j], sizeof(hex) - j, "%02X ", f->data[i]);
+      }
+      hex[j] = '\0';
+      debug_log("CAN rx id=0x%03lX len=%lu data=%s", f->id, f->len, hex);
+    }
     if (f->id == CAN_REQ_ID)
     {
       (void)can_send(CAN_REPLY_ID, f->data, f->len);
@@ -380,7 +481,18 @@ static void can_tick(uint32_t now_ms)
     uint32_t n = s_can_tx_count;
     memcpy(&d[0], &n, 4U);        /* counter, little-endian */
     memcpy(&d[4], &now_ms, 4U);   /* uptime in ms */
-    (void)can_send(CAN_TX_ID, d, 8U);
+    if (can_send(CAN_TX_ID, d, 8U))
+    {
+      s_last_101_count = n;
+    }
+  }
+
+  if (s_can_ok && loopback && ((now_ms % CAN_LB_REQ_PERIOD_MS) == 0U))
+  {
+    uint8_t d[8] = { CAN_LB_PATTERN0, CAN_LB_PATTERN1, 0U, 0U, 0U, 0U, 0U, 0U };
+    memcpy(&d[2], &s_lb_req_count, 4U);
+    s_lb_req_count++;
+    (void)can_send(CAN_REQ_ID, d, 8U);   /* comes back as 0x200, answered on 0x201 */
   }
 }
 
@@ -395,6 +507,37 @@ void comms_test_usb_rx(const uint8_t *buf, uint32_t len)
     memcpy(s_usb_rx, buf, n);
     s_usb_rx_len = n;
   }
+}
+
+void comms_test_usb_irq(void)
+{
+  uint16_t istr = USB->ISTR;
+  s_usb_irq++;
+  if ((istr & USB_ISTR_RESET) != 0U)  { s_usb_irq_reset++; }
+  if ((istr & USB_ISTR_SOF) != 0U)    { s_usb_irq_sof++; }
+  if ((istr & USB_ISTR_ERR) != 0U)    { s_usb_irq_err++; }
+  if ((istr & USB_ISTR_CTR) != 0U)    { s_usb_irq_ctr++; }
+  if ((istr & USB_ISTR_SUSP) != 0U)   { s_usb_irq_susp++; }
+}
+
+/* One line of USB and CRS status for diagnosing enumeration. FNR: frame
+ * number, LCK (2+ SOFs in a row), live D+/D- levels (idle J state = D+ 1,
+ * D- 0). CRS: TRIM, FEDIR/FECAP of the last SYNC (frequency error), and the
+ * SYNCOK/WARN/ERR/ESYNC flags since the last line, then cleared. */
+static void usb_diag_log(const char *why)
+{
+  uint16_t fnr = USB->FNR;
+  uint32_t isr = CRS->ISR;
+  /* Two lines: one would pass DEBUG_LOG_LINE_MAX (128) and lose the CRS flags. */
+  debug_log("USB %s: irq=%lu rst=%lu sof=%lu err=%lu ctr=%lu susp=%lu addr=%u",
+            why, s_usb_irq, s_usb_irq_reset, s_usb_irq_sof, s_usb_irq_err, s_usb_irq_ctr, s_usb_irq_susp,
+            hUsbDeviceFS.dev_address);
+  debug_log("USB fn=%u lck=%u dp=%u dm=%u | crs trim=%lu fecap=%lu fedir=%lu flags=0x%03lX",
+            (unsigned)(fnr & USB_FNR_FN), (fnr & USB_FNR_LCK) ? 1U : 0U,
+            (fnr & USB_FNR_RXDP) ? 1U : 0U, (fnr & USB_FNR_RXDM) ? 1U : 0U,
+            (CRS->CR & CRS_CR_TRIM) >> CRS_CR_TRIM_Pos, (isr & CRS_ISR_FECAP) >> CRS_ISR_FECAP_Pos,
+            (isr & CRS_ISR_FEDIR) ? 1UL : 0UL, isr & 0x70FUL);
+  CRS->ICR = CRS_ICR_SYNCOKC | CRS_ICR_SYNCWARNC | CRS_ICR_ERRC | CRS_ICR_ESYNCC;
 }
 
 /* CDC_Transmit_FS dereferences the class data, which exists only once the
@@ -427,6 +570,22 @@ static void usb_tick(uint32_t now_ms)
     debug_log("USB state %u -> %u (%s)", s_usb_state, st,
               (st == USBD_STATE_CONFIGURED) ? "configured: COM port ready" : "not configured");
     s_usb_state = st;
+    usb_diag_log("state");
+  }
+
+  /* Every new setup request the host sends (from the stack's copy of the
+   * last one); the first should be GET_DESCRIPTOR: 80 06 0100 0000 len 64. */
+  USBD_SetupReqTypedef rq = hUsbDeviceFS.request;
+  if (memcmp(&rq, &s_usb_last_req, sizeof(rq)) != 0)
+  {
+    s_usb_last_req = rq;
+    debug_log("USB setup bm=%02X req=%02X val=%04X idx=%04X len=%u",
+              rq.bmRequest, rq.bRequest, rq.wValue, rq.wIndex, rq.wLength);
+  }
+  if (hUsbDeviceFS.dev_address != s_usb_last_addr)
+  {
+    s_usb_last_addr = hUsbDeviceFS.dev_address;
+    debug_log("USB address %u", s_usb_last_addr);
   }
 
   uint32_t n = s_usb_rx_len;
@@ -452,33 +611,75 @@ static void usb_tick(uint32_t now_ms)
 
 void comms_test_init(void)
 {
-  debug_log("COMMS test: I2C1 IMU, USART2 115200 (J15), FDCAN2 500k (J10), USB CDC (J1)");
-  imu_probe();
-  uart_arm_rx();
-  debug_log("UART usart2 115200 8N1: tx every %u ms, rx logged and echoed", UART_TX_PERIOD_MS);
-  can_init();
-  s_usb_state = hUsbDeviceFS.dev_state;
-  debug_log("USB cdc: state %u, plug into the PC and open the COM port", s_usb_state);
+  debug_log("COMMS test: I2C1 IMU %s, USART2 (J15) %s, FDCAN2 (J10) %s, USB CDC (J1) %s",
+            COMMS_TEST_I2C ? "on" : "off", COMMS_TEST_UART ? "on" : "off",
+            COMMS_TEST_CAN ? "on" : "off", COMMS_TEST_USB ? "on" : "off");
+  if (COMMS_TEST_I2C)
+  {
+    imu_probe();
+  }
+  if (COMMS_TEST_UART)
+  {
+    uart_arm_rx();
+    debug_log("UART usart2 115200 8N1: tx every %u ms, rx logged and echoed", UART_TX_PERIOD_MS);
+  }
+  if (COMMS_TEST_CAN)
+  {
+    can_init();
+  }
+  if (COMMS_TEST_USB)
+  {
+    s_usb_state = hUsbDeviceFS.dev_state;
+    debug_log("USB cdc: state %u, HSI48 trim %lu (CRS, centre 64), plug into the PC and open the COM port",
+              s_usb_state, (CRS->CR & CRS_CR_TRIM) >> CRS_CR_TRIM_Pos);
+  }
 }
 
 void comms_test_tick(uint32_t now_ms)
 {
-  imu_tick(now_ms);
-  uart_tick(now_ms);
-  can_tick(now_ms);
-  usb_tick(now_ms);
+  if (COMMS_TEST_I2C)
+  {
+    imu_tick(now_ms);
+  }
+  if (COMMS_TEST_UART)
+  {
+    uart_tick(now_ms);
+  }
+  if (COMMS_TEST_CAN)
+  {
+    can_tick(now_ms);
+  }
+  if (COMMS_TEST_USB)
+  {
+    usb_tick(now_ms);
+  }
 
   if ((now_ms % STATUS_PERIOD_MS) == 0U)
   {
-    FDCAN_ProtocolStatusTypeDef ps;
-    FDCAN_ErrorCountersTypeDef ec;
-    (void)HAL_FDCAN_GetProtocolStatus(&hfdcan2, &ps);
-    (void)HAL_FDCAN_GetErrorCounters(&hfdcan2, &ec);
-    debug_log("UART tx=%lu rx=%lu B err=%lu ovr=%lu busy=%lu | IMU reads=%lu err=%lu addr=0x%02X",
-              s_uart_tx_count, s_uart_rx_bytes, s_uart_errors, s_uart_overruns, s_uart_tx_busy,
-              s_imu_reads, s_imu_errors, s_imu_addr);
-    debug_log("CAN tx=%lu full=%lu rx=%lu drop=%lu tec=%lu rec=%lu passive=%lu busoff=%lu lec=%lu | USB tx=%lu rx=%lu B",
-              s_can_tx_count, s_can_tx_full, s_can_rx_count, s_can_rx_dropped, ec.TxErrorCnt, ec.RxErrorCnt,
-              ps.ErrorPassive, ps.BusOff, ps.LastErrorCode, s_usb_tx_count, s_usb_rx_bytes);
+    if (COMMS_TEST_UART || COMMS_TEST_I2C)
+    {
+      debug_log("UART tx=%lu rx=%lu B err=%lu ovr=%lu busy=%lu | IMU reads=%lu err=%lu addr=0x%02X",
+                s_uart_tx_count, s_uart_rx_bytes, s_uart_errors, s_uart_overruns, s_uart_tx_busy,
+                s_imu_reads, s_imu_errors, s_imu_addr);
+    }
+    if (COMMS_TEST_CAN)
+    {
+      FDCAN_ProtocolStatusTypeDef ps;
+      FDCAN_ErrorCountersTypeDef ec;
+      (void)HAL_FDCAN_GetProtocolStatus(&hfdcan2, &ps);
+      (void)HAL_FDCAN_GetErrorCounters(&hfdcan2, &ec);
+      debug_log("CAN %s tx=%lu full=%lu rx=%lu drop=%lu tec=%lu rec=%lu passive=%lu busoff=%lu lec=%lu",
+                can_mode_name(s_can_mode), s_can_tx_count, s_can_tx_full, s_can_rx_count, s_can_rx_dropped,
+                ec.TxErrorCnt, ec.RxErrorCnt, ps.ErrorPassive, ps.BusOff, ps.LastErrorCode);
+      if (s_can_mode != CAN_MODE_NORMAL)
+      {
+        debug_log("CAN loopback check: ok=%lu bad=%lu (expect about 12 ok per second, 0 bad)", s_lb_ok, s_lb_bad);
+      }
+    }
+    if (COMMS_TEST_USB)
+    {
+      debug_log("USB tx=%lu rx=%lu B", s_usb_tx_count, s_usb_rx_bytes);
+      usb_diag_log("diag");
+    }
   }
 }

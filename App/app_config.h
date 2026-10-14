@@ -19,7 +19,21 @@
 /* Communication interface bench test (I2C IMU, USART2, FDCAN2, USB CDC),
  * run alongside the selected stage; see comms_test.h. Run with SW1 off and
  * the motor disconnected. 1 also silences the 1 s CUR/CTRL/SPIN lines. */
-#define COMMS_TEST 1
+#define COMMS_TEST 0
+
+/* Per-interface switches for the comms test (1 = run, 0 = left idle: the
+ * peripheral is initialised by CubeMX but never started, so FDCAN2 stays in
+ * init mode and drives nothing, USART2 neither sends nor arms reception, and
+ * I2C1 is not touched). */
+#define COMMS_TEST_I2C  0
+#define COMMS_TEST_UART 0
+#define COMMS_TEST_CAN  0
+#define COMMS_TEST_USB  1
+
+/* Throttle pots and supply-current sensor test (aux_sense.c): logs both
+ * pots and the ACS71240 supply current every 250 ms. The module itself runs
+ * from Stage 2 regardless; this switch only adds the log lines. */
+#define SENSOR_TEST 1
 
 /* Code on the 20 kHz control-interrupt path runs from SRAM: the linker
  * script's .RamFunc input section goes into .data, which the startup code

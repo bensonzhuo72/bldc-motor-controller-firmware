@@ -46,8 +46,13 @@ static uint32_t s_adc_timeouts;
 
 /* ---- ADC ------------------------------------------------------------------ */
 
-static bool power_adc_read(uint16_t *code)
+/* One regular conversion of a chosen ADC1 channel. ADC1's regular sequence
+ * is shared (VM_SENSE here, HALL_SENSE in aux_sense.c), so each read selects
+ * its channel; SQR1 may be written while JADSTART = 1 (only ADSTART must be
+ * 0, RM0440 ADC_SQR1), and ADSTART is 0 again once the previous read ended. */
+bool power_adc1_read(uint32_t channel, uint16_t *code)
 {
+  LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, channel);
   LL_ADC_REG_StartConversion(ADC1);
   uint32_t start = DWT->CYCCNT;
   while (!LL_ADC_IsActiveFlag_EOC(ADC1))
@@ -107,7 +112,7 @@ bool power_update(void)
   for (uint32_t i = 0U; i < POWER_SAMPLES_PER_TICK; i++)
   {
     uint16_t code;
-    if (power_adc_read(&code))
+    if (power_adc1_read(LL_ADC_CHANNEL_14, &code))
     {
       sum += code;
       n++;

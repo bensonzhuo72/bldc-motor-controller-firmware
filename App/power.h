@@ -42,6 +42,10 @@ bool power_motor_en_raw(void);
 uint32_t power_vm_mv(void);
 uint16_t power_vm_code(void);
 
+/** One ADC1 regular conversion of an LL_ADC_CHANNEL_x (main loop only;
+ *  false on timeout). Shared with aux_sense.c. */
+bool power_adc1_read(uint32_t channel, uint16_t *code);
+
 /** Number of ADC conversions that timed out since init. */
 uint32_t power_adc_timeouts(void);
 

@@ -47,8 +47,9 @@
  * control interrupt takes over. */
 #define APP_TEST_MODE   ((BRINGUP_STAGE >= 5) && (BRINGUP_STAGE <= 7))
 
-/* Stages 8-9 drive a voltage vector (fixed angle, then forced spin). */
-#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 9))
+/* Stages 8-10 drive a voltage vector (fixed angle, forced spin, then the
+ * Stage 10 alignment steps). */
+#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 10))
 
 /* Main-loop tick: 1 kHz (plan: Timing, interrupts and data sharing). */
 #define APP_TICK_S             0.001f
@@ -259,6 +260,36 @@ volatile float g_oc_trip = MOTOR_OC_TRIP_DEFAULT_A;
 volatile float g_vstep_v = 1.0f;      /* Stage 8 procedure step 7 */
 volatile float g_spin_hz = SPIN_HZ_INIT;      /* Stage 9: electrical Hz, sign = direction */
 volatile float g_spin_accel = SPIN_ACCEL_INIT;
+
+#if BRINGUP_STAGE >= 10
+/* Stage 10 encoder-to-electrical alignment (plan Stage 10). The d-axis
+ * vector (g_vec_v) is stepped through two electrical cycles forward, then
+ * two back; at each step the rotor settles and the encoder is averaged.
+ * Offset per point: theta_offset = wrap(DIR x 11 x theta_m - theta_cmd)
+ * (plan: Phase order, angles and direction). Forward and backward points
+ * are averaged so friction and cogging pull cancel. */
+#define APP_CMD_ALIGN         9U
+#define ALIGN_STEP_DEG        60.0f
+#define ALIGN_FWD_POINTS      13U      /* 0, 60 ... 720 deg */
+#define ALIGN_POINTS          25U      /* then 660 ... 0 deg */
+#define ALIGN_SLEW_DEG_PER_MS 0.12f    /* 120 deg/s electrical (1 rpm mechanical): the rotor follows */
+#define ALIGN_START_MS        2000U    /* at 0 deg: up to 1.2 V ramp at 1 V/s, then settle */
+#define ALIGN_SETTLE_MS       400U
+#define ALIGN_AVG_MS          64U      /* encoder samples averaged per point */
+#define ALIGN_CPC_NOMINAL     (16384.0f / (float)MOTOR_POLE_PAIRS)   /* 1489.5 counts per electrical cycle */
+#define ALIGN_CPC_TOL         0.10f    /* the rotor must follow within 10 % */
+#define ALIGN_PASS_DEV_DEG    2.0f     /* plan Stage 10 pass: repeat within +/-2 deg electrical */
+#define DEG_PER_COUNT_ELEC    (360.0f / 16384.0f)
+
+typedef enum
+{
+  ALIGN_IDLE = 0,
+  ALIGN_START,
+  ALIGN_MOVE,
+  ALIGN_SETTLE,
+  ALIGN_MEASURE
+} align_phase_t;
+#endif
 #endif
 
 static uint32_t s_last_tick_ms;
@@ -277,6 +308,22 @@ static uint32_t s_align_ms;         /* Stage 9: ms left holding at 0 deg after a
 static int32_t s_spin_pos0;         /* Stage 9: encoder position at the last log */
 static float s_spin_cyc0;           /* Stage 9: electrical cycles at the last log */
 static bool  s_lstep_active;        /* waiting for the step's capture */
+#if BRINGUP_STAGE >= 10
+static align_phase_t s_al_phase;    /* Stage 10 alignment run */
+static uint32_t s_al_timer;
+static uint32_t s_al_index;         /* point being taken */
+static float    s_al_theta_deg;     /* angle commanded now */
+static int64_t  s_al_pos_sum;      /* 64 multi-turn positions: can pass int32 after long runs */
+static uint32_t s_al_pos_n;
+static int32_t  s_al_pos[ALIGN_POINTS];   /* averaged multi-turn position per point */
+static bool     s_al_valid;         /* a run passed this boot: its result is used by TRACK */
+static int32_t  s_al_dir;
+static float    s_al_offset_deg;
+static float    s_tr_sum;           /* TRACK statistics over the log period */
+static float    s_tr_min;
+static float    s_tr_max;
+static uint32_t s_tr_n;
+#endif
 #if BRINGUP_STAGE == 8
 static uint32_t s_lstep_wait;       /* ms until the step is applied; 0 = none */
 static float s_lstep_v1;            /* step target, V */
@@ -1146,7 +1193,7 @@ static const char *fmt2(char *buf, size_t len, float x)
 }
 #endif
 
-static void vec_arm(void)
+static void vec_arm(bool align)
 {
   const char *reason;
   if (!s_foc_ok)
@@ -1159,6 +1206,13 @@ static void vec_arm(void)
 #if BRINGUP_STAGE >= 9
   ctrl_spin_reset();                               /* forced angle at 0 deg, not moving */
 #endif
+#if BRINGUP_STAGE >= 10
+  ctrl_set_vector(0.0f, 0.0f, 0.0f);               /* alignment starts at 0 deg */
+  ctrl_hold_angle(align);
+  s_al_phase = ALIGN_IDLE;
+#else
+  (void)align;
+#endif
   pwm_zero_command();
   if (motor_can_arm(&reason))
   {
@@ -1168,6 +1222,18 @@ static void vec_arm(void)
     s_move_deg = vec_theta() / DEG_TO_RAD;
     vec_move_start(-1.0f, VEC_ARM_SETTLE_MS);
 #else
+#if BRINGUP_STAGE >= 10
+    if (align)
+    {
+      s_al_phase = ALIGN_START;
+      s_al_timer = 0U;
+      s_al_index = 0U;
+      s_al_theta_deg = 0.0f;
+      debug_log("ALIGN armed: %lu mV d-axis, %u points (0..720..0 deg elec, %u deg steps), about 25 s",
+                (uint32_t)(vec_target() * 1000.0f), ALIGN_POINTS, (unsigned)ALIGN_STEP_DEG);
+      return;
+    }
+#endif
     char b[16];
     s_align_ms = SPIN_ALIGN_MS;
     s_spin_pos0 = vec_enc_position();
@@ -1179,6 +1245,9 @@ static void vec_arm(void)
   }
   else
   {
+#if BRINGUP_STAGE >= 10
+    ctrl_hold_angle(false);
+#endif
     debug_log("VEC arm refused: %s", reason);
   }
 }
@@ -1240,13 +1309,242 @@ static void vec_lstep_fit(void)
 }
 #endif
 
+#if BRINGUP_STAGE >= 10
+/* ---- Stage 10: alignment and angle tracking ---- */
+
+static float wrap180(float deg)
+{
+  while (deg >= 180.0f)
+  {
+    deg -= 360.0f;
+  }
+  while (deg < -180.0f)
+  {
+    deg += 360.0f;
+  }
+  return deg;
+}
+
+/* DIR x 11 x theta_m in electrical degrees [0, 360), no offset, computed in
+ * counts so it stays exact. */
+static float enc_elec_deg(int32_t pos, int32_t dir)
+{
+  int32_t c = pos % ENC_COUNTS_PER_TURN;
+  if (c < 0)
+  {
+    c += ENC_COUNTS_PER_TURN;
+  }
+  int32_t x = (c * (int32_t)MOTOR_POLE_PAIRS) % ENC_COUNTS_PER_TURN;
+  if (dir < 0)
+  {
+    x = (ENC_COUNTS_PER_TURN - x) % ENC_COUNTS_PER_TURN;
+  }
+  return (float)x * DEG_PER_COUNT_ELEC;
+}
+
+/* Commanded angle of point i: 0, 60 ... 720 forward, then 660 ... 0. */
+static float align_point_deg(uint32_t i)
+{
+  uint32_t k = (i < ALIGN_FWD_POINTS) ? i : ((ALIGN_POINTS - 1U) - i);
+  return (float)k * ALIGN_STEP_DEG;
+}
+
+/* Signed value with four decimals, for the radian offset. */
+static const char *fmt4(char *buf, size_t len, float x)
+{
+  int32_t v = (int32_t)((x * 10000.0f) + ((x < 0.0f) ? -0.5f : 0.5f));
+  uint32_t m = (uint32_t)((v < 0) ? -v : v);
+  (void)snprintf(buf, len, "%s%lu.%04lu", (v < 0) ? "-" : "", m / 10000UL, m % 10000UL);
+  return buf;
+}
+
+static void align_finish(void)
+{
+  char b1[16];
+  char b2[16];
+  char b3[16];
+  char b4[16];
+  float span_cycles = ((float)(ALIGN_FWD_POINTS - 1U) * ALIGN_STEP_DEG) / 360.0f;
+  float cpc_f = (float)(s_al_pos[ALIGN_FWD_POINTS - 1U] - s_al_pos[0]) / span_cycles;
+  float cpc_b = (float)(s_al_pos[ALIGN_POINTS - 1U] - s_al_pos[ALIGN_FWD_POINTS - 1U]) / -span_cycles;
+  int32_t dir = (cpc_f > 0.0f) ? 1 : -1;
+  float lo = ALIGN_CPC_NOMINAL * (1.0f - ALIGN_CPC_TOL);
+  float hi = ALIGN_CPC_NOMINAL * (1.0f + ALIGN_CPC_TOL);
+  float af = (float)dir * cpc_f;
+  float ab = (float)dir * cpc_b;
+  debug_log("ALIGN cnt/ecyc fwd=%ld bwd=%ld (expect +/-1489.5) -> dir=%+ld (motor_params %+d)",
+            (long)cpc_f, (long)cpc_b, (long)dir, MOTOR_ENC_DIR);
+  if (!(af > lo) || !(af < hi) || !(ab > lo) || !(ab < hi))
+  {
+    debug_log("ALIGN FAIL: rotor did not follow the steps (stuck, slipping, or too little torque: raise g_vec_v)");
+    return;
+  }
+
+  /* Offsets relative to the first point, so the average can't straddle
+   * the +/-180 deg wrap. */
+  float off0 = wrap180(enc_elec_deg(s_al_pos[0], dir) - align_point_deg(0U));
+  float rel[ALIGN_POINTS];
+  float sum = 0.0f;
+  float sum_f = 0.0f;
+  float sum_b = 0.0f;
+  for (uint32_t i = 0U; i < ALIGN_POINTS; i++)
+  {
+    float off = wrap180(enc_elec_deg(s_al_pos[i], dir) - align_point_deg(i));
+    rel[i] = wrap180(off - off0);
+    sum += rel[i];
+    if (i < ALIGN_FWD_POINTS)
+    {
+      sum_f += rel[i];
+    }
+    else
+    {
+      sum_b += rel[i];
+    }
+  }
+  float mean = sum / (float)ALIGN_POINTS;
+  float dev = 0.0f;
+  for (uint32_t i = 0U; i < ALIGN_POINTS; i++)
+  {
+    float d = rel[i] - mean;
+    d = (d < 0.0f) ? -d : d;
+    dev = (d > dev) ? d : dev;
+  }
+  float off_deg = wrap180(off0 + mean);
+  if (off_deg < 0.0f)
+  {
+    off_deg += 360.0f;
+  }
+  float fwd = wrap180(off0 + (sum_f / (float)ALIGN_FWD_POINTS));
+  float bwd = wrap180(off0 + (sum_b / (float)(ALIGN_POINTS - ALIGN_FWD_POINTS)));
+  s_al_valid = true;
+  s_al_dir = dir;
+  s_al_offset_deg = off_deg;
+  debug_log("ALIGN offset=%s deg elec (fwd %s, bwd %s; max point dev %s)",
+            fmt2(b1, sizeof(b1), off_deg), fmt2(b2, sizeof(b2), fwd), fmt2(b3, sizeof(b3), bwd),
+            fmt2(b4, sizeof(b4), dev));
+  debug_log("ALIGN result: MOTOR_ENC_DIR %ld, MOTOR_ENC_OFFSET_RAD %sf (used by TRACK until reset)",
+            (long)dir, fmt4(b1, sizeof(b1), off_deg * DEG_TO_RAD));
+}
+
+/* One alignment step per 1 ms tick, while armed. */
+static void align_tick(void)
+{
+  switch (s_al_phase)
+  {
+    case ALIGN_START:
+      if (++s_al_timer >= ALIGN_START_MS)
+      {
+        s_al_phase = ALIGN_MEASURE;
+        s_al_pos_sum = 0;
+        s_al_pos_n = 0U;
+      }
+      break;
+    case ALIGN_MOVE:
+    {
+      float target = align_point_deg(s_al_index);
+      float d = target - s_al_theta_deg;
+      if ((d > ALIGN_SLEW_DEG_PER_MS) || (d < -ALIGN_SLEW_DEG_PER_MS))
+      {
+        s_al_theta_deg += (d > 0.0f) ? ALIGN_SLEW_DEG_PER_MS : -ALIGN_SLEW_DEG_PER_MS;
+      }
+      else
+      {
+        s_al_theta_deg = target;
+        s_al_phase = ALIGN_SETTLE;
+        s_al_timer = 0U;
+      }
+      break;
+    }
+    case ALIGN_SETTLE:
+      if (++s_al_timer >= ALIGN_SETTLE_MS)
+      {
+        s_al_phase = ALIGN_MEASURE;
+        s_al_pos_sum = 0;
+        s_al_pos_n = 0U;
+      }
+      break;
+    case ALIGN_MEASURE:
+      s_al_pos_sum += vec_enc_position();
+      if (++s_al_pos_n >= ALIGN_AVG_MS)
+      {
+        float avg = (float)s_al_pos_sum / (float)s_al_pos_n;
+        int32_t pos = (int32_t)(avg + ((avg < 0.0f) ? -0.5f : 0.5f));
+        char b[16];
+        s_al_pos[s_al_index] = pos;
+        debug_log("ALIGN %2lu/%u cmd=%ld deg pos=%ld off=%s deg (dir %+d)", s_al_index + 1U, ALIGN_POINTS,
+                  (long)align_point_deg(s_al_index), (long)pos,
+                  fmt2(b, sizeof(b), wrap180(enc_elec_deg(pos, MOTOR_ENC_DIR) - align_point_deg(s_al_index))),
+                  MOTOR_ENC_DIR);
+        if (++s_al_index >= ALIGN_POINTS)
+        {
+          motor_disarm();
+          ctrl_hold_angle(false);
+          s_al_phase = ALIGN_IDLE;
+          debug_log("ALIGN steps done, disarmed");
+          align_finish();
+        }
+        else
+        {
+          s_al_phase = ALIGN_MOVE;
+        }
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/* Encoder electrical angle against the forced angle during the open-loop
+ * spin (plan Stage 10 step 2). Uses this boot's alignment result if there
+ * is one, otherwise motor_params.h. The error is the rotor's load angle
+ * plus any offset error: it should be steady at a steady speed. */
+static void track_tick(void)
+{
+  mt6701_snapshot_t e;
+  float f_now;
+  float cyc;
+  mt6701_snapshot(&e);
+  ctrl_spin_state(&f_now, &cyc);
+  float frac = cyc - (float)(int32_t)cyc;
+  if (frac < 0.0f)
+  {
+    frac += 1.0f;
+  }
+  int32_t dir = s_al_valid ? s_al_dir : MOTOR_ENC_DIR;
+  float off = s_al_valid ? s_al_offset_deg : (MOTOR_ENC_OFFSET_RAD / DEG_TO_RAD);
+  float err = wrap180(enc_elec_deg((int32_t)e.angle_counts, dir) - off - (frac * 360.0f));
+  if (s_tr_n == 0U)
+  {
+    s_tr_min = err;
+    s_tr_max = err;
+    s_tr_sum = 0.0f;
+  }
+  s_tr_sum += err;
+  s_tr_min = (err < s_tr_min) ? err : s_tr_min;
+  s_tr_max = (err > s_tr_max) ? err : s_tr_max;
+  s_tr_n++;
+}
+#endif
+
 static void vec_command(uint32_t cmd)
 {
   switch (cmd)
   {
     case APP_CMD_ARM:
-      vec_arm();
+      vec_arm(false);
       break;
+#if BRINGUP_STAGE >= 10
+    case APP_CMD_ALIGN:
+      if (pwm_is_armed())
+      {
+        debug_log("ALIGN refused: armed; g_app_cmd = 2 first");
+      }
+      else
+      {
+        vec_arm(true);
+      }
+      break;
+#endif
     case APP_CMD_DISARM:
       motor_disarm();
       s_lstep_active = false;
@@ -1353,7 +1651,12 @@ static void vec_tick(uint32_t now_ms)
       step = -VEC_SLEW_V_PER_MS;
     }
     s_vec_v += step;
+#if BRINGUP_STAGE >= 10
+    bool aligning = (s_al_phase != ALIGN_IDLE);
+    ctrl_set_vector(s_vec_v, aligning ? (s_al_theta_deg * DEG_TO_RAD) : vec_theta(), vec_shift());
+#else
     ctrl_set_vector(s_vec_v, vec_theta(), vec_shift());
+#endif
 
 #if BRINGUP_STAGE == 8
     float deg = vec_theta() / DEG_TO_RAD;
@@ -1364,23 +1667,43 @@ static void vec_tick(uint32_t now_ms)
     }
     vec_move_tick();
 #else
-    /* Hold at 0 deg until aligned, then spin toward the target (the
-     * interrupt slews the speed at spin_accel()). */
-    float f_t = 0.0f;
-    if (s_align_ms > 0U)
+#if BRINGUP_STAGE >= 10
+    if (aligning)
     {
-      s_align_ms--;
+      align_tick();
     }
     else
+#endif
     {
-      f_t = spin_target();
+      /* Hold at 0 deg until aligned, then spin toward the target (the
+       * interrupt slews the speed at spin_accel()). */
+      float f_t = 0.0f;
+      if (s_align_ms > 0U)
+      {
+        s_align_ms--;
+      }
+      else
+      {
+        f_t = spin_target();
+      }
+      ctrl_set_spin(f_t, spin_accel());
+#if BRINGUP_STAGE >= 10
+      track_tick();
+#endif
     }
-    ctrl_set_spin(f_t, spin_accel());
 #endif
   }
   else
   {
     s_vec_v = 0.0f;
+#if BRINGUP_STAGE >= 10
+    if (s_al_phase != ALIGN_IDLE)
+    {
+      s_al_phase = ALIGN_IDLE;
+      ctrl_hold_angle(false);
+      debug_log("ALIGN aborted at point %lu: disarmed (command, trip or fault)", s_al_index + 1U);
+    }
+#endif
 #if BRINGUP_STAGE == 8
     s_move_pending = false;
     s_lstep_wait = 0U;              /* a disarm or trip cancels a pending step */
@@ -1399,7 +1722,21 @@ static void vec_tick(uint32_t now_ms)
   /* Encoder against the forced angle over the last second (plan Stage 9
    * step 3): counts per electrical cycle = 16384 / pole pairs, signed by
    * the direction; current amplitude from the latest sample (Clarke). */
+#if BRINGUP_STAGE >= 10
+  if (!COMMS_TEST && (s_tr_n > 0U) && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))
+  {
+    char t1[16];
+    char t2[16];
+    char t3[16];
+    debug_log("TRACK err=%s deg elec (min %s max %s) over %lu ms, %s offset",
+              fmt2(t1, sizeof(t1), s_tr_sum / (float)s_tr_n), fmt2(t2, sizeof(t2), s_tr_min),
+              fmt2(t3, sizeof(t3), s_tr_max), s_tr_n, s_al_valid ? "measured" : "motor_params");
+    s_tr_n = 0U;
+  }
+  if (!COMMS_TEST && (s_al_phase == ALIGN_IDLE) && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))
+#else
   if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))   /* silent during the comms test */
+#endif
   {
     float f_now;
     float cyc;
@@ -1762,8 +2099,12 @@ void app_init(void)
   debug_log("STAGE8 g_app_cmd: 1 arm, 2 disarm, 3 sw break, 6 capture, 7 dump, 8 L step");
   debug_log("STAGE8 g_vec_v (V, max 1.2) g_vec_deg g_duty_shift (max 0.43) g_oc_trip (A, 0.1-1.5) g_vstep_v");
 #else
-  debug_log("STAGE9 g_app_cmd: 1 arm (align, then spin), 2 disarm, 3 sw break, 6 capture, 7 dump");
-  debug_log("STAGE9 g_vec_v (V, max 1.2) g_spin_hz (elec Hz, +/-10, 0 = hold) g_spin_accel (Hz/s, max 10) g_oc_trip");
+  debug_log("STAGE%d g_app_cmd: 1 arm (align, then spin), 2 disarm, 3 sw break, 6 capture, 7 dump", BRINGUP_STAGE);
+  debug_log("STAGE%d g_vec_v (V, max 1.2) g_spin_hz (elec Hz, +/-10, 0 = hold) g_spin_accel (Hz/s, max 10) g_oc_trip",
+            BRINGUP_STAGE);
+#if BRINGUP_STAGE >= 10
+  debug_log("STAGE10 g_app_cmd = 9: encoder alignment at g_vec_v (disarmed first); TRACK line while spinning");
+#endif
 #endif
 #endif
 

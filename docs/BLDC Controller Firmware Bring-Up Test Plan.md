@@ -182,7 +182,7 @@ The board has three layers of protection: the bench supply and power-path hardwa
 | Disarm order | Gates floating if ENABLE drops while PWM runs | Outputs off first, then ENABLE low, within the DRV's 40 µs window | Stage 5 |
 | MCU dead time (about 100 ns) | Backup to the DRV's own dead time | Every edge | Stage 5 |
 | Duty and voltage clamp | Over-modulation and losing the current-sample window | Duty ≤ about 93%; voltage vector limited to about 6.0 V, the largest vector that fits under the cap | Stage 7 |
-| Software overcurrent trip | Any phase current above the limit | Disarm within one 50 µs control cycle. 1 A until readings match a meter, then 1.5 A (Stage 8); 3 A (Stage 11); 4.5 A (Stage 14) | Stage 8 |
+| Software overcurrent trip | Any phase current above the limit | Disarm within one 50 µs control cycle. 1 A until readings match a meter, then 1.5 A (Stage 8); 1.5 A for Stage 11 (developer, 2026-10-14; was 3 A); 4.5 A (Stage 14) | Stage 8 |
 | DRV configuration readback | Registers lost to a reset or glitch | Mismatch → fault, disarm | Stage 4 |
 | Encoder faults | CRC errors, magnet too weak or strong, loss of track, impossible angle jumps | Disarm, motor coasts | Stage 9 |
 | Control-loop heartbeat | The control interrupt stops running (lost ADC trigger, stuck code) | Main loop sees no new count within a few ms → disarm | Stage 7 |
@@ -440,7 +440,7 @@ The motor first spins open loop at Stage 9 and first runs under FOC at Stage 11.
   - Detect the counting direction and store the offset.
 - **Procedure:**
   1. Run alignment five times and compare the offsets.
-  2. During open-loop spin, put the computed electrical angle on PA2 and phase A current on a second scope channel.
+  2. During open-loop spin, log the computed electrical angle against the forced angle (SWO / capture buffer; PA2 is USART2 since 2026-10-13, so the scope DAC output no longer exists).
 - **Pass:** the offset repeats within ±2° electrical, and the computed angle tracks the forced angle with only a constant error.
   - **Do not skip this stage.** A wrong offset, direction or phase order makes FOC run rough, vibrate or lock up, and those symptoms all look alike. Rerun it whenever the encoder or magnet is moved.
 
@@ -450,9 +450,9 @@ The motor first spins open loop at Stage 9 and first runs under FOC at Stage 11.
 - **Connected:** as in Stage 8, with the limit raised to 1.5 A.
 - **Firmware added:**
   - Control interrupt order: read the encoder → electrical angle with latency correction → inverse Park → space-vector PWM.
-  - Commands: Vd = 0 and a hardcoded Vq, changed through a ramp rather than an instant step. Software overcurrent trip raised to about 3 A: at standstill the phase current is about Vq ÷ 1.6 Ω, so Vq = 4 V draws about 2.5 A until the motor speeds up.
+  - Commands: Vd = 0 and a hardcoded Vq, changed through a ramp rather than an instant step. **Limits (developer, 2026-10-14): trip 1.5 A, Vq at most 2 V** (0.9 A at standstill; the plan had a 3 A trip and Vq up to 4 V). Original reasoning: at standstill the phase current is about Vq ÷ 2.2 Ω (measured R, Stage 8; was 1.6 Ω estimated), so Vq = 4 V draws about 1.8 A until the motor speeds up. Trip level and Vq range for this stage await the developer's decision (motor rated 0.55 A continuous; see the Bring-up log 2026-10-14).
 - **Procedure:**
-  1. Step Vq to 0.5, 1, 2 and 4 V, in both directions.
+  1. Step Vq to 0.5, 1 and 2 V, in both directions (4 V dropped with the 2 V limit).
   2. Log speed and VM over SWO. Watch VM during each Vq step-down: it should stay below about 14 V. If it rises further, lengthen the Vq ramp. This characterizes braking energy before the speed loop can command hard deceleration.
 - **Pass:** smooth rotation with speed roughly proportional to Vq. No-load speed approaches about Kv × √3 × Vq (about 420 rpm at Vq = 4 V). Current drops at speed as back-EMF rises.
 
@@ -602,7 +602,7 @@ All modules live outside the CubeMX "USER CODE" sections, so regenerating the pr
 - [x] Stage 1: encoder MODE pin set for I2C/SSI, magnet checks done (Stage 1 setup checklist).
 - [x] Stage 8: motor line-to-line resistance measured (expect about 3.2 Ω) to confirm the delta conversion. (4.4 Ω, 2026-10-08: the delta conversion doesn't hold; the 4.8 Ω spec reads as line-to-line. R = 2.2 Ω wye.)
 - [ ] Stage 8: current readings confirmed against a multimeter before the trip is raised above 1 A. (**Deferred by the developer, 2026-10-08**; trip stays at 1.0 A through Stage 9–10.)
-- [ ] **Stage 11 (blocks it): the deferred Stage 8 current check** — DC ammeter in series with phase A, or the voltmeter method (V_AB across MOTA–MOTB at 0°, Ia = V_AB ÷ 3.3 Ω), within 5 % of the logged Ia. Needed before the trip goes to 3 A.
+- [x] **Waived by the developer 2026-10-14** (see Bring-up log): ~~Stage 11 (blocks it): the deferred Stage 8 current check~~ — DC ammeter in series with phase A, or the voltmeter method (V_AB across MOTA–MOTB at 0°, Ia = V_AB ÷ 3.3 Ω), within 5 % of the logged Ia. Needed before the trip goes to 3 A.
 - [ ] Stage 13: inductance measured and current-loop gains recomputed from the measured R and L.
 
 ## Bring-up log
@@ -1003,4 +1003,22 @@ Dated record of findings, decisions and measured results, newest last. Each entr
 - **Sensor values (`docs/ACS71240.pdf`, ACS71240LLCBTR-050B3 performance table, VCC 3.3 V):** ±50 A, **26.4 mV/A**, zero-current output **1.65 V** (not ratiometric, so about code 2048 with VREF+ 3.3 V), offset error up to ±10 mV = ±0.38 A (so the firmware zero with SW1 off matters), noise 78 mA rms (150 kHz), output load ≤ 4.7 nF (board 2.2 nF, OK). The values first taken from distributor listings match; only the "VCC/2 ratiometric" wording was wrong. Resolution 0.806 mV/count = 30.5 mA per ADC count; motor tests so far draw well under 0.1 A from the supply (a few counts), so this test mainly checks the zero and the sign.
 - **Firmware (`App/aux_sense.c/h`, from Stage 2):** PA0/PA1 on ADC2 regular, PB12 on ADC1 regular, software-started and polled in the 1 kHz tick (no interrupt). ADC1's regular sequence is now shared with VM\_SENSE: `power_adc1_read(channel)` selects the channel on every read (SQR1 may change with JADSTART = 1, only ADSTART must be 0). Sampling time 47.5 cycles for the three channels (DS13122 Table 61, slow channel up to 1.8 kΩ), written in `aux_sense_init()` between `power_init()` and `cursense_init()` because SMPR can't be written once injected conversions are armed (JADSTART = 1). Throttles filtered (τ ≈ 8 ms) in permille; current: 4 samples per ms, filtered (τ ≈ 16 ms); zero re-measured over 512 ms whenever SW1 is off. Log every 250 ms: `AUX thr1= thr2= permille (code) to=` and `AUX isup= mA (min max) code= zero=`.
 - **CubeMX (documentation only; the pins are analog from reset):** PA0 → ADC2\_IN1, PA1 → ADC2\_IN2, PB12 → ADC1\_IN11, single-ended, without adding them to any regular rank.
+
+- **Results so far (developer's logs):** SW1 off: logic draws 50 mA from the bench supply. Spinning at the Stage 9 maximum (1.2 V, 10 Hz electrical): supply 156 mA, `isup` 74–80 mA, zero code 2050 (1.652 V, inside the datasheet's 1.65 V ± 10 mV), window min/max about −100 to +290 mA (sensor noise, as expected from 78 mA rms). 156 − 50 − relay coil (J123F1A5VDC.36: 0.36 W, about 35 mA from 12 V, estimate) ≈ 71 mA vs 74–80 mA read: within one ADC count (30.5 mA); sign positive under load. Cross-check: phase copper loss 1.5 × 0.442² × 2.2 Ω = 0.64 W against 12 V × 0.077 A = 0.92 W into VM, the rest being DRV and switching losses: plausible. Still to record: supply and `isup` with SW1 on, not armed (gives the coil current). THROTTLE1 reads 491 ‰ (code 2014) at mid-travel; **THROTTLE2 reads code 0**, to be checked (end stop, or PA1 / R15 / wiper open or shorted).
+- **Open-loop spin at the Stage 9 limit (10 Hz electrical = 54.5 rpm, 1.2 V):** in sync, forced 54 rpm, encoder-measured 54 rpm (sign as in Stage 9, MOTOR\_ENC\_DIR = −1), 1490 counts per electrical cycle (16384 / 11 = 1489.5), 10.99 pole pairs measured; Iamp 442 mA, phase RMS 75–80 counts × 4.03 mA = 300–325 mA (442 / √2 = 313); control ISR 7.2 µs (14.4 %). `task_max_us` reached 4.4 ms (main loop), most likely the once-per-second burst of SWO lines; watch it.
+
+### 2026-10-14: Status before Stage 10 and FOC
+
+- **Plan corrections:** Stage 11 standstill current used 1.6 Ω (estimate); measured R is 2.2 Ω, so Vq = 4 V gives about 1.8 A, not 2.5 A. Stage 10 step 2 used PA2 for the angle on the scope; PA2 is USART2 now, so the angle comparison is logged instead.
+- **Open before Stage 11:** (1) the deferred Stage 8 current check (blocker, Stage prerequisites); (2) the developer's decision on Stage 11 limits: the plan says trip 3 A and Vq up to 4 V (1.8 A at standstill), against the motor's 0.55 A continuous rating; the proposal is trip 1.5 A and Vq ≤ 2 V (0.9 A at standstill, about 210 rpm no-load) until the current check passes; (3) the encoder read moves from the 1 kHz main loop into the 20 kHz control interrupt: a blocking SPI1 read there is not allowed (code rules), so it needs SPI1 DMA started from the PWM timing, which means a CubeMX change, to be specified with the Stage 11 firmware.
+
+### 2026-10-14: Decisions for Stages 10–11; Stage 10 firmware
+
+- **Developer's decisions:** (1) the deferred Stage 8 independent current check is **waived**. Evidence in its place, all from this board's own sensors: phase RMS and Iamp agree (313 vs 300–325 mA), the supply-current sensor (an independent ACS71240 path) agrees with the bench supply within one count, and VM-side power matches copper loss plus driver losses. Risk accepted: a common gain error in the three phase CSAs would go unseen; the 1.5 A trip limit keeps the margin to the motor's ratings. (2) Stage 11 limits: **trip 1.5 A, Vq ≤ 2 V**. (3) The developer will make the CubeMX change for the encoder DMA (specified with the Stage 11 firmware). (4) Stage 10, then Stage 11.
+- **Stage 10 firmware (`app.c`, `ctrl.c/h`), `BRINGUP_STAGE 10`:**
+  - `ctrl_hold_angle()`: the control interrupt takes its angle from the main loop instead of the forced-angle generator.
+  - `g_app_cmd = 9` (disarmed): arms from 0 V like every arm, holds the d-axis vector (amplitude `g_vec_v`) at 0° for 2 s, then steps it 0 → 720° electrical and back to 0° in 60° steps (25 points), slewing at 120°/s, settling 400 ms and averaging the encoder over 64 ms at each point. Then disarms.
+  - Result: counts per electrical cycle forward and backward (must be 1489.5 ± 10 %, else FAIL: rotor didn't follow), direction from the forward sweep, offset θoffset = wrap(DIR × 11 × θm − θcmd) averaged over all points (relative to the first, so the ±180° wrap can't split the average), forward and backward means separately, and the largest point deviation. Logged as the values to put in `motor_params.h`. A disarm, trip or fault during the run aborts it.
+  - TRACK line (every second while spinning with `g_app_cmd = 1`): encoder electrical angle minus forced angle, mean / min / max, using this boot's alignment result (or `motor_params.h` if none). Expected: near 0 at standstill hold, a steady load-angle lag while spinning, same size in both directions with opposite sign.
+  - `SENSOR_TEST 0` (sensor test lines off).
 

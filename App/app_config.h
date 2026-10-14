@@ -9,7 +9,7 @@
 #define APP_CONFIG_H
 
 /* Current bring-up stage (plan: "Stages 0-4" onward). */
-#define BRINGUP_STAGE 9
+#define BRINGUP_STAGE 10
 
 /* Stage 0 one-off: execute an undefined instruction 5 s after boot to check
  * that the HardFault dump appears over SWO. Set to 1 only for that test
@@ -33,7 +33,7 @@
 /* Throttle pots and supply-current sensor test (aux_sense.c): logs both
  * pots and the ACS71240 supply current every 250 ms. The module itself runs
  * from Stage 2 regardless; this switch only adds the log lines. */
-#define SENSOR_TEST 1
+#define SENSOR_TEST 0
 
 /* Code on the 20 kHz control-interrupt path runs from SRAM: the linker
  * script's .RamFunc input section goes into .data, which the startup code

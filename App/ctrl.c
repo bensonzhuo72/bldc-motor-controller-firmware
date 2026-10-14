@@ -37,6 +37,7 @@ static volatile float    s_accel;          /* Hz/s */
 static volatile float    s_f_now;
 static volatile float    s_theta_f;        /* rad, [0, 2 pi) */
 static volatile int32_t  s_ecycles;
+static volatile bool     s_hold;           /* Stage 10: angle from the main loop, not the generator */
 
 /* ---- Control interrupt ---------------------------------------------------- */
 
@@ -75,32 +76,39 @@ APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT])
 
   float theta;
 #if BRINGUP_STAGE >= 9
-  /* Forced angle (plan Stage 9): the speed slews toward the target at the
-   * set acceleration and the angle integrates it. */
-  float df = s_f_target - s_f_now;
-  float dmax_f = s_accel * CTRL_DT_S;
-  if (df > dmax_f)
+  if (s_hold)
   {
-    df = dmax_f;
+    theta = s_theta;   /* Stage 10 alignment: angle stepped by the main loop */
   }
-  else if (df < -dmax_f)
+  else
   {
-    df = -dmax_f;
+    /* Forced angle (plan Stage 9): the speed slews toward the target at the
+     * set acceleration and the angle integrates it. */
+    float df = s_f_target - s_f_now;
+    float dmax_f = s_accel * CTRL_DT_S;
+    if (df > dmax_f)
+    {
+      df = dmax_f;
+    }
+    else if (df < -dmax_f)
+    {
+      df = -dmax_f;
+    }
+    s_f_now += df;
+    float th = s_theta_f + (CTRL_TWO_PI * s_f_now * CTRL_DT_S);
+    if (th >= CTRL_TWO_PI)
+    {
+      th -= CTRL_TWO_PI;
+      s_ecycles++;
+    }
+    else if (th < 0.0f)
+    {
+      th += CTRL_TWO_PI;
+      s_ecycles--;
+    }
+    s_theta_f = th;
+    theta = th;
   }
-  s_f_now += df;
-  float th = s_theta_f + (CTRL_TWO_PI * s_f_now * CTRL_DT_S);
-  if (th >= CTRL_TWO_PI)
-  {
-    th -= CTRL_TWO_PI;
-    s_ecycles++;
-  }
-  else if (th < 0.0f)
-  {
-    th += CTRL_TWO_PI;
-    s_ecycles--;
-  }
-  s_theta_f = th;
-  theta = th;
 #else
   theta = s_theta;
 #endif
@@ -207,6 +215,11 @@ void ctrl_set_spin(float f_target_hz, float accel_hz_s)
   s_f_target = f_target_hz;
   s_accel = accel_hz_s;
   __set_PRIMASK(primask);
+}
+
+void ctrl_hold_angle(bool hold)
+{
+  s_hold = hold;   /* single word: no lock needed */
 }
 
 void ctrl_spin_state(float *f_now_hz, float *cycles)

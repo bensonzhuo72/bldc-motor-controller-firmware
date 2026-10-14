@@ -44,6 +44,10 @@ void ctrl_spin_reset(void);
 void ctrl_set_spin(float f_target_hz, float accel_hz_s);
 void ctrl_spin_state(float *f_now_hz, float *cycles);
 
+/** Stage 10: true = the interrupt uses the angle from ctrl_set_vector()
+ *  (alignment steps), false = the Stage 9 forced-angle generator. */
+void ctrl_hold_angle(bool hold);
+
 /** Phase voltages last commanded (V, before injection) and the highest
  *  duty, for logging. */
 void ctrl_last_output(float vph[PHASE_COUNT], float *duty_max);

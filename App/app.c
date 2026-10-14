@@ -29,6 +29,9 @@
 #include "foc_math.h"
 #include "motor_params.h"
 #endif
+#if COMMS_TEST
+#include "comms_test.h"
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -984,8 +987,9 @@ static void ctrl_tick(uint32_t now_ms)
 
 #if BRINGUP_STAGE >= 7
   /* Current level and noise per phase over the last second (plan Stage 7
-   * step 3; Stage 8 steps 3-5), control interrupt time and load. */
-  if ((now_ms % CUR_LOG_PERIOD_MS) == 0U)
+   * step 3; Stage 8 steps 3-5), control interrupt time and load. Silent
+   * during the comms test. */
+  if (!COMMS_TEST && ((now_ms % CUR_LOG_PERIOD_MS) == 0U))
   {
     cursense_stats_t st;
     float off[PHASE_COUNT];
@@ -1392,7 +1396,7 @@ static void vec_tick(uint32_t now_ms)
   /* Encoder against the forced angle over the last second (plan Stage 9
    * step 3): counts per electrical cycle = 16384 / pole pairs, signed by
    * the direction; current amplitude from the latest sample (Clarke). */
-  if ((now_ms % VEC_LOG_PERIOD_MS) == 0U)
+  if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))   /* silent during the comms test */
   {
     float f_now;
     float cyc;
@@ -1433,7 +1437,7 @@ static void vec_tick(uint32_t now_ms)
               (long)cpc, fmt2(b3, sizeof(b3), pp), (uint32_t)(i_amp * AMPS_TO_MA), fault_name(fault_first()));
   }
 #else
-  if ((now_ms % VEC_LOG_PERIOD_MS) == 0U)
+  if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))   /* silent during the comms test */
   {
     float vph[PHASE_COUNT];
     float dmax;
@@ -1672,7 +1676,7 @@ void app_init(void)
 #if BRINGUP_STAGE >= 2
   debug_log_reset_cause();
 #endif
-  debug_log("SCOPE dac3+opamp1 %s", debug_ok ? "OK" : "FAIL");
+  debug_log("DAC3 %s (scope pin retired: PA2/PA3 are USART2)", debug_ok ? "OK" : "FAIL");
   (void)app_check_clock();
   app_check_cycle_counter();
   app_check_safe_pins();
@@ -1742,6 +1746,10 @@ void app_init(void)
 #endif
 #endif
 
+#if COMMS_TEST
+  comms_test_init();
+#endif
+
   s_last_tick_ms = HAL_GetTick();
 }
 
@@ -1789,6 +1797,9 @@ void app_loop(void)
     test_tick(s_last_tick_ms);
 #elif APP_VEC_MODE
     vec_tick(s_last_tick_ms);
+#endif
+#if COMMS_TEST
+    comms_test_tick(s_last_tick_ms);
 #endif
     uint32_t elapsed = debug_cycles() - start;
     if (elapsed > s_task_max_cycles)

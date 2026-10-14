@@ -1,7 +1,7 @@
 /**
  * @file    debug.h
- * @brief   SWO logging, CPU cycle counter, scope DAC on PA2, timing pin on PA3,
- *          HardFault dump.
+ * @brief   SWO logging, CPU cycle counter, capture buffer, HardFault/NMI
+ *          dump. (Scope DAC and PA3 timing pin retired 2026-10-13.)
  *
  * Logging is main-loop only (plan: Timing, interrupts and data sharing).
  * The scope and timing-pin helpers are register writes, safe in interrupts.
@@ -18,11 +18,10 @@
 #define DEBUG_CPU_HZ             170000000UL
 #define DEBUG_CYCLES_PER_US      (DEBUG_CPU_HZ / 1000000UL)
 
-/* DAC3 is 12-bit; 4095 is full scale, about 3.3 V at PA2 via OPAMP1. */
+/* DAC3 is 12-bit; 4095 is full scale. */
 #define DEBUG_SCOPE_FULL_SCALE   4095UL
 
-/** Start the cycle counter and the scope output (DAC3_CH1 -> OPAMP1 -> PA2).
- *  Returns false if the DAC or op-amp failed to start. */
+/** Start the cycle counter and DAC3. Returns false if the DAC failed. */
 bool debug_init(void);
 
 /** printf-style log line over SWO (ITM port 0); a newline is appended.
@@ -65,24 +64,15 @@ static inline uint32_t debug_cycles(void)
   return DWT->CYCCNT;
 }
 
-/** Timing pin PA3. */
-static inline void debug_timing_high(void)
-{
-  BOARD_TIMING_PORT->BSRR = BOARD_TIMING_PIN;
-}
+/** Timing pin: none since 2026-10-13 (PA3 is USART2 RX on J15). Kept as
+ *  no-ops so callers stay unchanged; interrupt time is logged on the CTRL
+ *  line instead. */
+static inline void debug_timing_high(void) {}
+static inline void debug_timing_low(void) {}
+static inline void debug_timing_toggle(void) {}
 
-static inline void debug_timing_low(void)
-{
-  BOARD_TIMING_PORT->BRR = BOARD_TIMING_PIN;
-}
-
-static inline void debug_timing_toggle(void)
-{
-  uint32_t odr = BOARD_TIMING_PORT->ODR;
-  BOARD_TIMING_PORT->BSRR = ((odr & BOARD_TIMING_PIN) << 16U) | (~odr & BOARD_TIMING_PIN);
-}
-
-/** Scope output: 12-bit code (0..4095) to DAC3 CH1, buffered by OPAMP1 on PA2. */
+/** Scope DAC: 12-bit code to DAC3 CH1, internal only since 2026-10-13
+ *  (OPAMP1 to PA2 removed). Harmless; kept so callers stay unchanged. */
 static inline void debug_scope_write(uint32_t code)
 {
   DAC3->DHR12R1 = (code > DEBUG_SCOPE_FULL_SCALE) ? DEBUG_SCOPE_FULL_SCALE : code;

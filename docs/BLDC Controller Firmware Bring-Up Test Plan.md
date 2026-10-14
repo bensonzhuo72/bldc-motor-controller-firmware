@@ -54,8 +54,11 @@ All STM32G491RE pins the bring-up firmware uses, plus the pins it leaves alone, 
 | SOA | PB2 | ADC2\_IN12 | 7 | Phase A current-sense output, 56 Ω / 2.2 nF filter |
 | SOB | PB1 | ADC1\_IN12 | 7 | Phase B current-sense output, 56 Ω / 2.2 nF filter |
 | SOC | PB0 | ADC3\_IN12 | 7 | Phase C current-sense output, 56 Ω / 2.2 nF filter |
-| Scope DAC output | PA2 (J15) | DAC3\_CH1 → OPAMP1 follower → OPAMP1\_VOUT | 0 | One analog channel for the scope |
-| Timing pin | PA3 (J15) | GPIO output | 0 | Toggled in the control interrupt |
+| UART TX / RX | PA2 / PA3 (J15) | USART2 (AF7), 115200 8N1 | comms test | **Changed 2026-10-13:** given back to the UART. Until then PA2 was the scope DAC output (DAC3 → OPAMP1) and PA3 the timing pin; both are retired (OPAMP1 removed in CubeMX; DAC3 kept, internal only). Interrupt time is logged on the `CTRL` line instead |
+| IMU SDA / SCL | PB9 / PA15 | I2C1 (AF4), 400 kHz | comms test | LSM6DSOX (SA0 low: 0x6A) and header J11; 4.7k pull-ups |
+| IMU INT1 / INT2 | PB4 / PB7 | GPIO input | comms test | Not used by the test yet |
+| CAN RX / TX | PB5 / PB6 | FDCAN2 (AF9), classic 500 kbit/s | comms test | SN65HVD232 transceiver, header J10 |
+| USB D− / D+ | PA11 / PA12 | USB FS device, CDC (virtual COM port) | comms test | Clock HSI48, trimmed by CRS from USB SOF |
 | Status LED | PC3 | GPIO output (drives Q7) | 0 | LED4 |
 | SWO | PB3 | Trace output | 0 | Logging and telemetry |
 | SWDIO | PA13 | Debug | 0 | ST-Link on J2 |
@@ -72,13 +75,9 @@ All STM32G491RE pins the bring-up firmware uses, plus the pins it leaves alone, 
 | THROTTLE2 | PA1 | ADC | On-board 10k pot through R15 100 Ω |
 | HALL\_SENSE | PB12 | ADC1\_IN11 | ACS71240 total-current sensor |
 | TEMP\_SENSE | PC0 | ADC | 100k thermistor with 4.87k pull-up |
-| IMU SDA / SCL | PB9 / PA15 | I2C1 | LSM6DSOX and header J11 |
-| IMU INT1 / INT2 | PB4 / PB7 | GPIO / EXTI |  |
-| CAN RX / TX | PB5 / PB6 | FDCAN2 | SN65HVD232 transceiver, header J10 |
-| USB D− / D+ | PA11 / PA12 | USB FS |  |
 | Not connected | PC2, PC4, PC5, PC6, PC7, PC13, PC14 | — | No-connect on the schematic |
 
-PA2 and PA3 are the UART pins on J15. They are borrowed for debugging because the UART isn't used.
+PA2 and PA3 are the UART pins on J15. They were borrowed for debugging (scope DAC, timing pin) through Stage 9, and returned to USART2 on 2026-10-13.
 
 ## Key hardware facts and parameters
 
@@ -953,3 +952,27 @@ Dated record of findings, decisions and measured results, newest last. Each entr
 - **Pass (plan):** turns smoothly ✔; 11 electrical cycles per mechanical turn ✔; encoder speed matches the forced speed (counts per cycle, no slip) ✔; current 0.37–0.45 A (the plan's "near 0.6 A" assumed 1.6 Ω; with the measured 2.2 Ω, 1 V gives about 0.45 A) ✔; both directions ✔.
 - **Recorded:** `MOTOR_ENC_DIR = -1` in `motor_params.h` (to be confirmed by Stage 10), plus `MOTOR_ENC_OFFSET_RAD` as TODO\_MEASURED for Stage 10. Motor leads must stay in their present order on J13.
 - **Reminder:** the deferred Stage 8 current check (Stage prerequisites) must be done before Stage 11.
+
+### 2026-10-13: CubeMX pin labels renamed (developer)
+
+- `.ioc` changes, labels only (no pin, peripheral or clock change): PB0 `ADC_IN_CURRENT` → `ADC_IN_C`; PB1 `ADC_IN_B` and PB2 `ADC_IN_A` (new); PC10/PC11/PC12 `SPI3_SCLK_DRIVER` / `SPI3_MISO_DRIVER` / `SPI3_CS_MOSI_DRIVER` → `SPI3_SCLK` / `SPI3_MISO` / `SPI3_CS_MOSI`; PD2 `SPI3_CS` (new). CORDIC appears in the init list.
+- Generated code not yet regenerated at the time of the check (`main.h`, `adc.c`, `spi.c` still had the old names). Only generated files use these labels; `App/` refers to pins directly, so no App change is needed; CubeMX renames its own uses consistently.
+- Naming note: PC12 is SPI3 MOSI only (DRV SDI); chip select is PD2. `SPI3_MOSI` would be clearer than `SPI3_CS_MOSI`.
+
+### 2026-10-13: Communication interface test (outside the 16 stages)
+
+- **Developer decisions:** PA2/PA3 go back to USART2 permanently (scope DAC output and PA3 timing pin retired); HAL may be used for communication code in the main loop (the 20 kHz control interrupt stays HAL-free). Other MCU: UART 3.3 V, 115200; CAN 500 kbit/s with its own transceiver and termination. IMU SA0 is low (0x6A); the test tries 0x6B too. USB is tested from a PC.
+- **CubeMX review of the regenerated project:**
+  - OK: I2C1 PB9/PA15 Fast mode (timing 0x40621236 from PCLK1 170 MHz); USART2 PA2/PA3 115200 8N1 (PCLK1); FDCAN2 classic, PCLK1 170 MHz, prescaler 17, seg1 15, seg2 4 = 500 kbit/s at 80 %; USB device FS CDC, clock HSI48; PB4/PB7 INT1/INT2 inputs; UCPD dead-battery pull-downs disabled in `HAL_MspInit` (PB6 is CAN TX); `ADC1_2_IRQHandler`/HardFault still not generated; NMI USER CODE kept.
+  - **Wrong: FDCAN2 RX on PB12** (CubeMX's default). The schematic has CAN RX on **PB5**; PB12 is HALL\_SENSE. CAN can't receive until this is changed.
+  - **Wrong: USART2, FDCAN2 IT0/IT1 and USB\_LP interrupts at priority 0**, the same as the control interrupt and TIM1 break. The plan (Timing, interrupts) requires everything else lower; the USB stack's interrupt in particular can run long. Set them to **6** (below the nFAULT EXTI at 4; SysTick stays 15).
+  - **Missing: CRS.** HSI48 alone is only ±3 % over temperature (DS13122 Table 43); USB full speed needs ±0.25 %. Enable RCC → CRS SYNC from USB.
+  - Optional: FDCAN SJW 1 → 4 (more tolerant of clock differences), automatic retransmission on (normal CAN behaviour; off now, so a frame with no ACK is dropped after one try).
+  - Consequence of OPAMP1/PA3 removal: `debug.c` no longer starts OPAMP1; `debug_timing_*` became no-ops; `board.h` timing pin removed. PA3 scope checks from Stages 7–8 are no longer possible; interrupt time is on the `CTRL` line.
+- **Firmware (`App/comms_test.c/h`, enabled by `COMMS_TEST 1` in `app_config.h`, called from `app_init`/`app_loop` alongside the selected stage):**
+  - **I2C:** probes WHO\_AM\_I (0Fh = 6Ch) at 0x6A then 0x6B; configures CTRL3\_C = 44h (BDU, IF\_INC), CTRL1\_XL = 40h (104 Hz, ±2 g), CTRL2\_G = 40h (104 Hz, ±250 dps); every 200 ms reads 14 bytes from 20h (temperature, gyro, accel) and logs g, dps (0.061 mg/LSB, 8.75 mdps/LSB) and °C (256 LSB/°C, 0 = 25 °C). Re-probes every 1 s if not found.
+  - **UART:** `G491 uart n= t=` line every 500 ms; reception to idle line by interrupt; each received burst logged and echoed back as `echo: ...`.
+  - **CAN:** global filter accepts all data frames into RX FIFO 0; ID 0x101 every 100 ms (counter, uptime ms); every received frame logged; a frame on ID 0x200 is answered on 0x201 with the same data (no blanket echo, so two echoing nodes can't ping-pong). Error counters, error-passive and bus-off logged every 2 s.
+  - **USB CDC:** state changes logged; `G491 usb n= t=` every 1 s; typed text logged and echoed. `CDC_Transmit_FS` is only called once the PC has configured the device (it dereferences class data that doesn't exist before). Hook: `comms_test_usb_rx()` in `usbd_cdc_if.c` USER CODE 6.
+  - The 1 s `CUR`/`CTRL`/`SPIN` lines are silenced while `COMMS_TEST` is 1. SW1 stays off: no VM\_OK, so arming is refused.
+- **CubeMX re-check after the developer's fixes:** FDCAN2 RX now on PB5 (TX PB6; PB12 free); USART2, FDCAN2 IT0/IT1 and USB\_LP at preemption priority 6, sub-priority 0 (priority group 4 has no sub-priority bits); ADC1\_2 and TIM1 break still 0; CRS on, synced from USB SOF (reload for 1 kHz SOF, error limit 34, HSI48 trim 32). USER CODE hooks survived (CDC receive hook, NMI). Optional SJW and auto-retransmission left at 1 / off.

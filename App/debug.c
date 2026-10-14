@@ -5,7 +5,6 @@
 #include "debug.h"
 #include "app_config.h"
 #include "dac.h"
-#include "opamp.h"
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -198,11 +197,9 @@ bool debug_init(void)
   DWT->CYCCNT = 0U;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  /* Scope output: DAC3 CH1 (internal) -> OPAMP1 follower -> PA2. */
-  if (HAL_OPAMP_Start(&hopamp1) != HAL_OK)
-  {
-    ok = false;
-  }
+  /* DAC3 CH1 (internal). Its OPAMP1 follower to PA2 was removed on
+   * 2026-10-13 when PA2/PA3 went back to USART2 (J15), so it no longer
+   * reaches a pin; kept so the scope writes stay harmless. */
   if (HAL_DAC_Start(&hdac3, DAC_CHANNEL_1) != HAL_OK)
   {
     ok = false;

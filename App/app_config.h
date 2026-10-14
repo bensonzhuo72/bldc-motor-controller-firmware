@@ -16,6 +16,11 @@
  * (needs BRINGUP_STAGE 0). */
 #define STAGE0_FAULT_TEST 0
 
+/* Communication interface bench test (I2C IMU, USART2, FDCAN2, USB CDC),
+ * run alongside the selected stage; see comms_test.h. Run with SW1 off and
+ * the motor disconnected. 1 also silences the 1 s CUR/CTRL/SPIN lines. */
+#define COMMS_TEST 1
+
 /* Code on the 20 kHz control-interrupt path runs from SRAM: the linker
  * script's .RamFunc input section goes into .data, which the startup code
  * copies from flash (STM32G491XX_FLASH.ld). From flash, with 4 wait states,

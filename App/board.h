@@ -14,8 +14,7 @@
 /* ---- GPIO ---------------------------------------------------------------- */
 #define BOARD_LED_PORT          LED_STATUS_GPIO_Port      /* PC3 -> Q7 -> LED4 */
 #define BOARD_LED_PIN           LED_STATUS_Pin
-#define BOARD_TIMING_PORT       Timing_GPIO_Port          /* PA3 on J15 */
-#define BOARD_TIMING_PIN        Timing_Pin
+/* No timing pin: PA3 (J15) went back to USART2 RX on 2026-10-13. */
 #define BOARD_DRV_ENABLE_PORT   ENABLE_GPIO_Port          /* PC8, low at boot */
 #define BOARD_DRV_ENABLE_PIN    ENABLE_Pin
 #define BOARD_DRV_CAL_PORT      CAL_GPIO_Port             /* PC9, held low */

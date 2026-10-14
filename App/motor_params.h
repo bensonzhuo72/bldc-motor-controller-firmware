@@ -28,11 +28,15 @@
  * open-loop spin at +/-5 and +8 Hz electrical, encoder counts per electrical
  * cycle -1489 in both directions, so the count falls as the angle advances
  * A -> B -> C: DIR = -1, with the motor leads in their present order on J13.
- * Stage 10 confirms it. */
+ * Stage 10, 2026-10-14: confirmed by five alignment runs. */
 #define MOTOR_ENC_DIR          (-1)
 
-/* TODO_MEASURED (Stage 10): electrical angle at encoder count 0. */
-#define MOTOR_ENC_OFFSET_RAD   0.0f
+/* Electrical-angle offset (theta_e = wrap(DIR x 11 x theta_m - offset)).
+ * Stage 10, 2026-10-14: five alignment runs at 1.0 V d-axis, 25 points each
+ * (0..720..0 deg in 60 deg steps): 334.56, 334.65, 334.59, 334.63, 334.58 deg
+ * electrical, mean 334.60 deg (spread 0.09 deg, pass +/-2). Rerun Stage 10
+ * if the magnet, encoder or motor lead order changes. */
+#define MOTOR_ENC_OFFSET_RAD   5.8400f
 
 /* Back-EMF constant, datasheet (plan: Motor table). */
 #define MOTOR_KE_V_PER_RAD_S   0.1562f

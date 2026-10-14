@@ -48,6 +48,14 @@ void ctrl_spin_state(float *f_now_hz, float *cycles);
  *  (alignment steps), false = the Stage 9 forced-angle generator. */
 void ctrl_hold_angle(bool hold);
 
+/** Stage 11 voltage-mode FOC. set_foc: true = the interrupt commutates on
+ *  the encoder angle with Vd = 0 and Vq from set_vq (V, phase amplitude;
+ *  set before arming). take_enc_event: true once after the interrupt
+ *  disarmed on a bad encoder sample. Main loop. */
+void ctrl_set_foc(bool on);
+void ctrl_set_vq(float vq);
+bool ctrl_take_enc_event(void);
+
 /** Phase voltages last commanded (V, before injection) and the highest
  *  duty, for logging. */
 void ctrl_last_output(float vph[PHASE_COUNT], float *duty_max);

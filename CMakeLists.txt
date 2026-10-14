@@ -63,7 +63,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # it took 6.6 us per call, over the plan's 10 % budget (5 us of 50 us;
 # Bring-up log 2026-10-08, Stage 7). The rest stays at -O0 for debugging.
 # Source options come after CMAKE_C_FLAGS_DEBUG on the command line, so -O2 wins.
-set_source_files_properties(App/cursense.c App/pwm.c App/debug.c App/ctrl.c App/foc_math.c
+# mt6701.c joined at Stage 11: the encoder is read in the control interrupt.
+set_source_files_properties(App/cursense.c App/pwm.c App/debug.c App/ctrl.c App/foc_math.c App/mt6701.c
     PROPERTIES COMPILE_OPTIONS "-O2")
 
 # Add include paths

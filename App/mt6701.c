@@ -8,6 +8,7 @@
  * dummy transmit data (plan: MT6701 encoder, "Clock" and "Speed").
  */
 #include "mt6701.h"
+#include "app_config.h"
 #include "board.h"
 #include "main.h"
 
@@ -72,6 +73,7 @@ static float s_pll_ki;
 static float s_pll_angle_rad;
 static int32_t s_jump_limit_counts;
 static bool s_have_reference;
+static bool s_isr_pending;      /* a split read was started by mt6701_isr_start() */
 
 /* ---- Helpers -------------------------------------------------------------- */
 
@@ -111,7 +113,7 @@ static inline float mt6701_wrap_2pi(float x)
 
 /* CRC-6, polynomial x^6 + x + 1, MSB first, initial value 0
  * (datasheet 7.8.2: over D[13:0] then Mg[3:0], D13 first). */
-static uint8_t mt6701_crc6(uint32_t data)
+APP_RAMFUNC static uint8_t mt6701_crc6(uint32_t data)
 {
   uint8_t crc = 0U;
   for (int32_t i = (int32_t)MT6701_CRC_DATA_BITS - 1; i >= 0; i--)
@@ -238,19 +240,10 @@ bool mt6701_init(float dt_s)
   return cfg_ok;
 }
 
-bool mt6701_update(void)
+/* Decode one 24-bit frame: CRC, status, unwrap, PLL. Shared by the
+ * blocking read and the split interrupt read. */
+APP_RAMFUNC static bool mt6701_process(uint32_t word)
 {
-  uint32_t word;
-
-  s_state.counters.reads++;
-
-  if (!mt6701_spi_read24(&word))
-  {
-    s_state.counters.spi_timeouts++;
-    s_state.sample_ok = false;
-    s_state.healthy = false;
-    return false;
-  }
   s_state.raw_word = word;
 
   uint32_t data18 = word >> MT6701_STATUS_SHIFT;
@@ -334,6 +327,86 @@ bool mt6701_update(void)
   s_state.sample_ok = true;
   s_state.healthy = (field == MT6701_FIELD_NORMAL) && !mt6701_loss_of_track(status);
   return true;
+}
+
+bool mt6701_update(void)
+{
+  uint32_t word;
+
+  s_state.counters.reads++;
+
+  if (!mt6701_spi_read24(&word))
+  {
+    s_state.counters.spi_timeouts++;
+    s_state.sample_ok = false;
+    s_state.healthy = false;
+    return false;
+  }
+  return mt6701_process(word);
+}
+
+/* Split read for the control interrupt (Stage 11): mt6701_isr_start() pulls
+ * CS low and queues both dummy frames; the SPI clocks the 24 bits out in
+ * about 4.5 us by itself, and the RX FIFO (32 bits) holds both 12-bit
+ * frames. mt6701_isr_collect() in the next interrupt, 50 us later, takes
+ * them and raises CS (T_L, last clock to CS rise, is long met). Nothing
+ * waits on the SPI. */
+APP_RAMFUNC void mt6701_isr_collect(void)
+{
+  if (!s_isr_pending)
+  {
+    return;
+  }
+  s_isr_pending = false;
+  volatile uint16_t *dr = (volatile uint16_t *)&SPI1->DR;
+  uint16_t hi = 0U;
+  uint16_t lo = 0U;
+  bool ok = false;
+  if ((SPI1->SR & SPI_SR_RXNE) != 0U)
+  {
+    hi = *dr;
+    if ((SPI1->SR & SPI_SR_RXNE) != 0U)
+    {
+      lo = *dr;
+      ok = ((SPI1->SR & SPI_SR_BSY) == 0U);
+    }
+  }
+  BOARD_ENC_CS_PORT->BSRR = BOARD_ENC_CS_PIN;
+  s_state.counters.reads++;
+  if (!ok)
+  {
+    for (uint32_t i = 0U; (i < MT6701_RX_FIFO_MAX_ENTRIES) && ((SPI1->SR & SPI_SR_RXNE) != 0U); i++)
+    {
+      (void)*dr;
+    }
+    s_state.counters.spi_timeouts++;
+    s_state.sample_ok = false;
+    s_state.healthy = false;
+    return;
+  }
+  (void)mt6701_process((((uint32_t)hi & MT6701_FRAME_MASK) << MT6701_FRAME_BITS) |
+                       ((uint32_t)lo & MT6701_FRAME_MASK));
+}
+
+APP_RAMFUNC void mt6701_isr_start(void)
+{
+  volatile uint16_t *dr = (volatile uint16_t *)&SPI1->DR;
+  for (uint32_t i = 0U; (i < MT6701_RX_FIFO_MAX_ENTRIES) && ((SPI1->SR & SPI_SR_RXNE) != 0U); i++)
+  {
+    (void)*dr;
+  }
+  BOARD_ENC_CS_PORT->BRR = BOARD_ENC_CS_PIN;
+  mt6701_wait_cycles(MT6701_CS_SETUP_CYCLES);   /* T_H >= 100 ns: 200 ns, the only wait */
+  *dr = 0U;
+  *dr = 0U;
+  s_isr_pending = true;
+}
+
+APP_RAMFUNC bool mt6701_isr_angle(uint16_t *counts, float *speed_rad_s)
+{
+  *counts = s_state.angle_counts;
+  *speed_rad_s = s_state.speed_rad_s;
+  return s_state.sample_ok && s_state.healthy;
 }
 
 void mt6701_snapshot(mt6701_snapshot_t *out)

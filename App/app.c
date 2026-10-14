@@ -47,12 +47,20 @@
  * control interrupt takes over. */
 #define APP_TEST_MODE   ((BRINGUP_STAGE >= 5) && (BRINGUP_STAGE <= 7))
 
-/* Stages 8-10 drive a voltage vector (fixed angle, forced spin, then the
- * Stage 10 alignment steps). */
-#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 10))
+/* Stages 8-11 drive a voltage vector (fixed angle, forced spin, the Stage 10
+ * alignment steps) and, from Stage 11, voltage-mode FOC. */
+#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 11))
 
 /* Main-loop tick: 1 kHz (plan: Timing, interrupts and data sharing). */
 #define APP_TICK_S             0.001f
+
+/* Encoder update interval: the main-loop tick until Stage 10; from Stage 11
+ * the control interrupt reads it (20 kHz, plan: Timing). */
+#if BRINGUP_STAGE >= 11
+#define ENC_DT_S               50e-6f
+#else
+#define ENC_DT_S               APP_TICK_S
+#endif
 
 /* Expected clock tree (plan: TIM1 and control timing, "Clock"):
  * 24 MHz HSE, PLL M = 6, N = 85, R = 2 -> 170 MHz SYSCLK = HCLK. */
@@ -243,7 +251,9 @@ volatile uint32_t g_phase_off;
 
 /* Stage 9 forced spin (plan Stage 9 step 1: about 1 V, ramp 0 to 5 Hz
  * electrical). The limit keeps open loop in sync: at 10 Hz electrical the
- * back-EMF is 0.1562 x 2 pi x 10 / 11 = 0.89 V, close to the 1 V applied.
+ * back-EMF is 0.1562 x 2 pi x 10 / 11 = 0.89 V line-to-line (Ke is
+ * line-to-line), 0.51 V phase amplitude against the 1-1.2 V applied
+ * (corrected 2026-10-14: the comparison first used the line value).
  * The rotor is held at 0 deg for SPIN_ALIGN_MS after arming (ramp, then
  * settle) before the angle starts to move. */
 #define SPIN_HZ_INIT         5.0f
@@ -256,7 +266,11 @@ volatile uint32_t g_phase_off;
 volatile float g_vec_v = VEC_V_INIT;
 volatile float g_vec_deg = 0.0f;
 volatile float g_duty_shift = 0.0f;
+#if BRINGUP_STAGE >= 11
+volatile float g_oc_trip = MOTOR_OC_TRIP_STAGE_MAX_A;   /* Stage 11: 1.5 A (developer, 2026-10-14) */
+#else
 volatile float g_oc_trip = MOTOR_OC_TRIP_DEFAULT_A;
+#endif
 volatile float g_vstep_v = 1.0f;      /* Stage 8 procedure step 7 */
 volatile float g_spin_hz = SPIN_HZ_INIT;      /* Stage 9: electrical Hz, sign = direction */
 volatile float g_spin_accel = SPIN_ACCEL_INIT;
@@ -290,6 +304,24 @@ typedef enum
   ALIGN_MEASURE
 } align_phase_t;
 #endif
+
+#if BRINGUP_STAGE >= 11
+/* Stage 11 voltage-mode FOC (plan Stage 11): Vd = 0, Vq = g_vq on the
+ * encoder angle, no current loop. Limits (developer, 2026-10-14): |Vq| at
+ * most 2 V, so at most 2 / 2.2 Ohm = 0.91 A with the rotor held, under the
+ * 1.5 A trip. Every arm starts at Vq = 0 and every change is ramped (plan:
+ * "changed through a ramp"), which also limits the braking energy pumped
+ * into VM when Vq steps down. */
+#define APP_CMD_FOC           10U
+#define FOC_VQ_MAX            2.0f
+#define FOC_VQ_INIT           0.5f     /* plan Stage 11 step 1: first level */
+#define FOC_VQ_SLEW_V_PER_MS  0.001f   /* 1 V/s */
+/* No-load speed: back-EMF line amplitude = Ke x w (Ke is line-to-line, plan:
+ * Motor table, matches Kv 61 rpm/V), phase amplitude Vq = Ke x w / sqrt 3,
+ * so w = sqrt 3 x Vq / Ke: 106 rpm per volt of Vq. */
+#define FOC_RPM_PER_VQ        (1.7320508f / MOTOR_KE_V_PER_RAD_S * RAD_S_TO_RPM)
+volatile float g_vq = FOC_VQ_INIT;
+#endif
 #endif
 
 static uint32_t s_last_tick_ms;
@@ -319,6 +351,12 @@ static int32_t  s_al_pos[ALIGN_POINTS];   /* averaged multi-turn position per po
 static bool     s_al_valid;         /* a run passed this boot: its result is used by TRACK */
 static int32_t  s_al_dir;
 static float    s_al_offset_deg;
+#if BRINGUP_STAGE >= 11
+static bool     s_foc_on;           /* armed in FOC mode */
+static float    s_vq_applied;       /* ramped Vq, V */
+static int32_t  s_foc_pos0;         /* encoder position at the last FOC log */
+static uint32_t s_vm_max_mv;        /* highest VM since the last FOC log */
+#endif
 static float    s_tr_sum;           /* TRACK statistics over the log period */
 static float    s_tr_min;
 static float    s_tr_max;
@@ -471,7 +509,9 @@ static void enc_tick(mt6701_snapshot_t *s)
   debug_timing_high();
 #endif
   uint32_t start = debug_cycles();
-  (void)mt6701_update();
+#if BRINGUP_STAGE < 11
+  (void)mt6701_update();         /* from Stage 11 the control interrupt reads it */
+#endif
   uint32_t elapsed = debug_cycles() - start;
 #if BRINGUP_STAGE < 7
   debug_timing_low();
@@ -1206,6 +1246,10 @@ static void vec_arm(bool align)
 #if BRINGUP_STAGE >= 9
   ctrl_spin_reset();                               /* forced angle at 0 deg, not moving */
 #endif
+#if BRINGUP_STAGE >= 11
+  ctrl_set_foc(false);
+  s_foc_on = false;
+#endif
 #if BRINGUP_STAGE >= 10
   ctrl_set_vector(0.0f, 0.0f, 0.0f);               /* alignment starts at 0 deg */
   ctrl_hold_angle(align);
@@ -1526,13 +1570,128 @@ static void track_tick(void)
 }
 #endif
 
+#if BRINGUP_STAGE >= 11
+/* ---- Stage 11: voltage-mode FOC ---- */
+
+static float foc_vq_target(void)
+{
+  float v = g_vq;
+  if (!(v >= -FOC_VQ_MAX) || !(v <= FOC_VQ_MAX))   /* NaN or beyond the limit */
+  {
+    return (v > 0.0f) ? FOC_VQ_MAX : ((v < 0.0f) ? -FOC_VQ_MAX : 0.0f);
+  }
+  return v;
+}
+
+static void foc_arm(void)
+{
+  const char *reason;
+  char b[16];
+  if (!s_foc_ok)
+  {
+    debug_log("FOC arm refused: CORDIC not running (CubeMX: activate CORDIC)");
+    return;
+  }
+  s_vq_applied = 0.0f;                     /* zero command, then ramp */
+  ctrl_set_vq(0.0f);
+  ctrl_hold_angle(false);
+  ctrl_set_vector(0.0f, 0.0f, 0.0f);
+  ctrl_set_foc(true);
+  pwm_zero_command();
+  if (motor_can_arm(&reason))
+  {
+    s_foc_on = true;
+    s_foc_pos0 = vec_enc_position();
+    s_vm_max_mv = 0U;
+    debug_log("FOC armed: Vd 0, Vq 0 -> %s V at 1 V/s, encoder angle, trip %lu mA",
+              fmt2(b, sizeof(b), foc_vq_target()), (uint32_t)(s_trip_applied * 1000.0f));
+  }
+  else
+  {
+    ctrl_set_foc(false);
+    debug_log("FOC arm refused: %s", reason);
+  }
+}
+
+/* While in FOC mode: ramp Vq, log once a second. */
+static void foc_tick(uint32_t now_ms)
+{
+  if (pwm_is_armed())
+  {
+    float d = foc_vq_target() - s_vq_applied;
+    if (d > FOC_VQ_SLEW_V_PER_MS)
+    {
+      d = FOC_VQ_SLEW_V_PER_MS;
+    }
+    else if (d < -FOC_VQ_SLEW_V_PER_MS)
+    {
+      d = -FOC_VQ_SLEW_V_PER_MS;
+    }
+    s_vq_applied += d;
+    ctrl_set_vq(s_vq_applied);
+  }
+
+  if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))
+  {
+    char b1[16];
+    char b2[16];
+    mt6701_snapshot_t e;
+    cursense_snapshot_t cs;
+    mt6701_snapshot(&e);
+    cursense_snapshot(&cs);
+    int32_t pos = vec_enc_position();
+    int32_t dpos = pos - s_foc_pos0;
+    s_foc_pos0 = pos;
+    /* Positive = the direction positive Vq drives (electrical angle rising). */
+    float rpm = (float)MOTOR_ENC_DIR * ((float)dpos / (float)ENC_COUNTS_PER_TURN) * 60000.0f / (float)VEC_LOG_PERIOD_MS;
+    float pll = (float)MOTOR_ENC_DIR * e.speed_rad_s * RAD_S_TO_RPM;
+    float i_alpha = cs.amps[PHASE_A];
+    float i_beta = (cs.amps[PHASE_B] - cs.amps[PHASE_C]) * 0.577350269f;   /* 1/sqrt(3) */
+    float i_amp = foc_sqrtf((i_alpha * i_alpha) + (i_beta * i_beta));
+    debug_log("FOC Vq=%sV tgt=%s rpm=%ld pll=%ld noload=%ld Iamp=%lumA vm=%lu max=%lumV %s",
+              fmt2(b1, sizeof(b1), s_vq_applied), fmt2(b2, sizeof(b2), foc_vq_target()),
+              (long)rpm, (long)pll, (long)(s_vq_applied * FOC_RPM_PER_VQ), (uint32_t)(i_amp * AMPS_TO_MA),
+              power_vm_mv(), s_vm_max_mv, fault_name(fault_first()));
+    s_vm_max_mv = 0U;
+  }
+
+  if (!pwm_is_armed())
+  {
+    s_foc_on = false;
+    s_vq_applied = 0.0f;
+    ctrl_set_vq(0.0f);
+    ctrl_set_foc(false);
+    debug_log("FOC off: disarmed");
+  }
+}
+#endif
+
 static void vec_command(uint32_t cmd)
 {
   switch (cmd)
   {
     case APP_CMD_ARM:
+#if BRINGUP_STAGE >= 11
+      if (pwm_is_armed())
+      {
+        debug_log("ARM refused: already armed; g_app_cmd = 2 first");
+        break;
+      }
+#endif
       vec_arm(false);
       break;
+#if BRINGUP_STAGE >= 11
+    case APP_CMD_FOC:
+      if (pwm_is_armed())
+      {
+        debug_log("FOC refused: already armed; g_app_cmd = 2 first");
+      }
+      else
+      {
+        foc_arm();
+      }
+      break;
+#endif
 #if BRINGUP_STAGE >= 10
     case APP_CMD_ALIGN:
       if (pwm_is_armed())
@@ -1627,6 +1786,22 @@ static void vec_tick(uint32_t now_ms)
     g_app_cmd = APP_CMD_NONE;
     vec_command(cmd);
   }
+
+#if BRINGUP_STAGE >= 11
+  if (ctrl_take_enc_event())
+  {
+    /* The interrupt already disarmed; latch the fault like enc_monitor does. */
+    (void)fault_raise(FAULT_ENCODER, 0xFFU, 0U);
+    debug_log("FOC disarmed by the control interrupt: bad encoder sample");
+  }
+  uint32_t vm_now = power_vm_mv();
+  s_vm_max_mv = (vm_now > s_vm_max_mv) ? vm_now : s_vm_max_mv;
+  if (s_foc_on)
+  {
+    foc_tick(now_ms);
+    return;
+  }
+#endif
 
 #if BRINGUP_STAGE == 8
   if (pwm_is_armed() && (s_lstep_wait != 0U) && (--s_lstep_wait == 0U))
@@ -2036,7 +2211,7 @@ void app_init(void)
   app_check_safe_pins();
 
 #if BRINGUP_STAGE >= 1
-  bool enc_cfg_ok = mt6701_init(APP_TICK_S);
+  bool enc_cfg_ok = mt6701_init(ENC_DT_S);
   debug_log("ENC spi1 mode1 12bit div32 %s", enc_cfg_ok ? "OK" : "FAIL");
   (void)mt6701_update();
   mt6701_snapshot_t s;
@@ -2104,6 +2279,9 @@ void app_init(void)
             BRINGUP_STAGE);
 #if BRINGUP_STAGE >= 10
   debug_log("STAGE10 g_app_cmd = 9: encoder alignment at g_vec_v (disarmed first); TRACK line while spinning");
+#endif
+#if BRINGUP_STAGE >= 11
+  debug_log("STAGE11 g_app_cmd = 10: voltage-mode FOC (Vd 0), g_vq (V, +/-2, ramped 1 V/s); encoder read in the ISR");
 #endif
 #endif
 #endif

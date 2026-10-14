@@ -64,6 +64,18 @@ bool mt6701_init(float dt_s);
  *  Returns true if the sample was good. */
 bool mt6701_update(void);
 
+/** Stage 11 split read, control interrupt only (the main loop must not
+ *  touch SPI1 once these run): collect() finishes the read started by the
+ *  previous interrupt's start() and decodes it; start() begins the next.
+ *  The angle used is therefore one control period (50 us) old. */
+void mt6701_isr_collect(void);
+void mt6701_isr_start(void);
+
+/** Control interrupt: last angle (counts) and PLL speed (mechanical rad/s,
+ *  sign = encoder count direction). False if the last sample was bad or
+ *  unhealthy. */
+bool mt6701_isr_angle(uint16_t *counts, float *speed_rad_s);
+
 /** Copy the state with interrupts briefly disabled. */
 void mt6701_snapshot(mt6701_snapshot_t *out);
 

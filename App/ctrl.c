@@ -59,6 +59,36 @@ static volatile bool     s_enc_event;
 #define CTRL_RAD_PER_ECOUNT  (6.28318530718f / (float)CTRL_ENC_COUNTS)
 #define CTRL_ENC_LATENCY_S   100e-6f
 
+/* Encoder electrical angle for this interrupt, from the read collected at
+ * its start (Stage 11+): as sampled, without latency correction, and the
+ * electrical speed. Interrupt only. */
+static float s_th_enc;
+static float s_we;
+static bool  s_th_ok;
+
+/* Stage 12 rotating-frame currents (plan Stage 12, shadow mode: measured,
+ * not controlled). The phase currents are sampled in this interrupt; the
+ * encoder sample is one period older (50 us) plus the MT6701 propagation
+ * delay (up to 5 us, datasheet), so its angle is advanced by 55 us of
+ * speed. Amplitude-invariant Clarke with all three currents and Park as in
+ * the plan (Firmware conventions, Transforms): Iq = peak phase current. */
+#define CTRL_ENC_AGE_S       55e-6f
+#define CTRL_ONE_THIRD       0.333333333f
+#define CTRL_INV_SQRT3       0.577350269f
+/* Capture encoding in dq mode: mA + 32768 (+/-32 A range), angle as
+ * 0..65535 per electrical turn. */
+#define CTRL_CAP_MA_OFFSET   32768.0f
+#define CTRL_CAP_ANGLE_SCALE (65536.0f / 6.28318530718f)
+static volatile bool     s_cap_dq;
+static volatile float    s_dq_sum_id;
+static volatile float    s_dq_sum_iq;
+static volatile float    s_dq_min_id;
+static volatile float    s_dq_max_id;
+static volatile float    s_dq_min_iq;
+static volatile float    s_dq_max_iq;
+static volatile uint32_t s_dq_n;
+static volatile uint32_t s_dq_bad;     /* interrupts without a valid angle */
+
 /* ---- Control interrupt ---------------------------------------------------- */
 
 APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
@@ -100,22 +130,14 @@ APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
 #if BRINGUP_STAGE >= 11
   if (s_foc)
   {
-    uint16_t counts;
-    float speed;
-    if (!mt6701_isr_angle(&counts, &speed))
+    if (!s_th_ok)
     {
       /* Bad or unhealthy encoder sample: no valid angle to commutate on. */
       motor_disarm();
       s_enc_event = true;
       return;
     }
-    uint32_t e = ((uint32_t)counts * MOTOR_POLE_PAIRS) & CTRL_ENC_MASK;
-    if (MOTOR_ENC_DIR < 0)
-    {
-      e = (CTRL_ENC_COUNTS - e) & CTRL_ENC_MASK;
-    }
-    float w_e = (float)MOTOR_ENC_DIR * (float)MOTOR_POLE_PAIRS * speed;
-    theta = ((float)e * CTRL_RAD_PER_ECOUNT) - MOTOR_ENC_OFFSET_RAD + (w_e * CTRL_ENC_LATENCY_S);
+    theta = s_th_enc + (s_we * CTRL_ENC_LATENCY_S);
     vd = 0.0f;
     vq = s_vq;
   }
@@ -195,11 +217,98 @@ APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
  * finish the read started last time (so the angle is fresh for this step),
  * run the step, then start the next read whatever the step did (armed or
  * not, trip or not), so the encoder keeps updating while disarmed. */
-APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT])
+#if BRINGUP_STAGE >= 11
+/* Electrical angle = DIR x 11 x theta_m - offset, from the encoder sample
+ * just collected (plan: Phase order, angles and direction). */
+APP_RAMFUNC static void ctrl_enc_angle(void)
+{
+  uint16_t counts;
+  float speed;
+  s_th_ok = mt6701_isr_angle(&counts, &speed);
+  uint32_t e = ((uint32_t)counts * MOTOR_POLE_PAIRS) & CTRL_ENC_MASK;
+  if (MOTOR_ENC_DIR < 0)
+  {
+    e = (CTRL_ENC_COUNTS - e) & CTRL_ENC_MASK;
+  }
+  s_we = (float)MOTOR_ENC_DIR * (float)MOTOR_POLE_PAIRS * speed;
+  s_th_enc = ((float)e * CTRL_RAD_PER_ECOUNT) - MOTOR_ENC_OFFSET_RAD;
+}
+#endif
+
+#if BRINGUP_STAGE >= 12
+/* Id, Iq from this interrupt's currents and the encoder angle; statistics
+ * for the main loop. False (and nothing computed) without a valid angle. */
+APP_RAMFUNC static bool ctrl_dq(const float amps[PHASE_COUNT], float *id, float *iq, float *th)
+{
+  if (!s_th_ok)
+  {
+    s_dq_bad++;
+    return false;
+  }
+  float sn;
+  float cs;
+  *th = s_th_enc + (s_we * CTRL_ENC_AGE_S);
+  foc_sincos(*th, &sn, &cs);
+  float i_alpha = ((2.0f * amps[PHASE_A]) - amps[PHASE_B] - amps[PHASE_C]) * CTRL_ONE_THIRD;
+  float i_beta = (amps[PHASE_B] - amps[PHASE_C]) * CTRL_INV_SQRT3;
+  float d = (i_alpha * cs) + (i_beta * sn);
+  float q = (i_beta * cs) - (i_alpha * sn);
+  *id = d;
+  *iq = q;
+  if (s_dq_n == 0U)
+  {
+    s_dq_min_id = d;
+    s_dq_max_id = d;
+    s_dq_min_iq = q;
+    s_dq_max_iq = q;
+  }
+  s_dq_sum_id += d;
+  s_dq_sum_iq += q;
+  s_dq_min_id = (d < s_dq_min_id) ? d : s_dq_min_id;
+  s_dq_max_id = (d > s_dq_max_id) ? d : s_dq_max_id;
+  s_dq_min_iq = (q < s_dq_min_iq) ? q : s_dq_min_iq;
+  s_dq_max_iq = (q > s_dq_max_iq) ? q : s_dq_max_iq;
+  s_dq_n++;
+  return true;
+}
+
+APP_RAMFUNC static uint16_t ctrl_cap_ma(float a)
+{
+  float v = (a * 1000.0f) + CTRL_CAP_MA_OFFSET;
+  v = (v < 0.0f) ? 0.0f : ((v > 65535.0f) ? 65535.0f : v);
+  return (uint16_t)v;
+}
+#endif
+
+/* Called by the control interrupt. From Stage 11 the encoder is read here:
+ * finish the read started last time (so the angle is fresh for this step),
+ * compute the angle (and from Stage 12 Id, Iq), record the capture sample,
+ * run the step, then start the next read whatever the step did (armed or
+ * not, trip or not), so the encoder keeps updating while disarmed. The
+ * capture sample is pushed before the step, so a trigger from the step
+ * lands after this interrupt's sample (debug.h). */
+APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHASE_COUNT])
 {
 #if BRINGUP_STAGE >= 11
   mt6701_isr_collect();
+  ctrl_enc_angle();
 #endif
+#if BRINGUP_STAGE >= 12
+  float id = 0.0f;
+  float iq = 0.0f;
+  float th = 0.0f;
+  bool dq_ok = ctrl_dq(amps, &id, &iq, &th);
+  if (s_cap_dq)
+  {
+    float t = th * CTRL_CAP_ANGLE_SCALE;
+    int32_t ti = (int32_t)t;
+    debug_capture_push(dq_ok ? ctrl_cap_ma(id) : 0U, dq_ok ? ctrl_cap_ma(iq) : 0U, (uint16_t)(ti & 0xFFFF));
+  }
+  else
+#endif
+  {
+    debug_capture_push(raw[PHASE_A], raw[PHASE_B], raw[PHASE_C]);
+  }
   ctrl_step(amps);
 #if BRINGUP_STAGE >= 11
   mt6701_isr_start();
@@ -291,6 +400,31 @@ void ctrl_set_foc(bool on)
 void ctrl_set_vq(float vq)
 {
   s_vq = vq;       /* single word */
+}
+
+void ctrl_capture_dq(bool dq)
+{
+  s_cap_dq = dq;
+}
+
+void ctrl_dq_stats(ctrl_dq_stats_t *out)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  uint32_t n = s_dq_n;
+  out->n = n;
+  out->bad = s_dq_bad;
+  out->id_mean = (n > 0U) ? (s_dq_sum_id / (float)n) : 0.0f;
+  out->iq_mean = (n > 0U) ? (s_dq_sum_iq / (float)n) : 0.0f;
+  out->id_min = s_dq_min_id;
+  out->id_max = s_dq_max_id;
+  out->iq_min = s_dq_min_iq;
+  out->iq_max = s_dq_max_iq;
+  s_dq_sum_id = 0.0f;
+  s_dq_sum_iq = 0.0f;
+  s_dq_n = 0U;
+  s_dq_bad = 0U;
+  __set_PRIMASK(primask);
 }
 
 bool ctrl_take_enc_event(void)

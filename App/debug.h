@@ -45,6 +45,8 @@ bool debug_capture_get(uint32_t n, uint16_t out[3]);
 #define DEBUG_CAPTURE_LEN      1024U
 #define DEBUG_CAPTURE_TRIGGER  512U
 bool debug_capture_dump_start(void);
+/** What the three capture columns hold, printed by dump_start. Main loop. */
+void debug_capture_label(const char *label);
 bool debug_capture_dump_tick(void);
 
 /** Log the reset cause from RCC_CSR, then clear the flags (plan Stage 2). */

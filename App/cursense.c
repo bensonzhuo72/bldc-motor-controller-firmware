@@ -356,8 +356,7 @@ APP_RAMFUNC void ADC1_2_IRQHandler(void)
 
   s_count++;
   debug_scope_write(r[PHASE_A]);      /* PA2: SOA as the ADC sees it */
-  debug_capture_push(r[PHASE_A], r[PHASE_B], r[PHASE_C]);
-  ctrl_isr(amps);                     /* overcurrent trip, then the PWM output */
+  ctrl_isr(amps, r);                  /* capture sample, overcurrent trip, then the PWM output */
 
   debug_timing_low();
   uint32_t dt = DWT->CYCCNT - t0;

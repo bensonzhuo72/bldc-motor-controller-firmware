@@ -73,6 +73,7 @@ static volatile uint32_t s_cap_idx;
 static volatile uint32_t s_cap_post;
 static volatile cap_state_t s_cap_state;
 static uint32_t s_cap_dump_left;   /* main loop only */
+static const char *s_cap_label = "counts A B C";
 static uint32_t s_cap_dump_i;
 
 APP_RAMFUNC void debug_capture_push(uint16_t a, uint16_t b, uint16_t c)
@@ -132,6 +133,11 @@ bool debug_capture_get(uint32_t n, uint16_t out[3])
   return true;
 }
 
+void debug_capture_label(const char *label)
+{
+  s_cap_label = label;
+}
+
 bool debug_capture_dump_start(void)
 {
   if ((s_cap_state != CAP_DONE) || (s_cap_dump_left != 0U))
@@ -140,8 +146,8 @@ bool debug_capture_dump_start(void)
   }
   s_cap_dump_i = s_cap_idx;   /* oldest sample */
   s_cap_dump_left = DEBUG_CAP_SAMPLES;
-  debug_log("CAP begin n=%u trigger_at=%u (t = n x 50 us; counts A B C)",
-            DEBUG_CAP_SAMPLES, DEBUG_CAP_SAMPLES - DEBUG_CAP_POST);
+  debug_log("CAP begin n=%u trigger_at=%u (t = n x 50 us; %s)",
+            DEBUG_CAP_SAMPLES, DEBUG_CAP_SAMPLES - DEBUG_CAP_POST, s_cap_label);
   return true;
 }
 

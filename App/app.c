@@ -47,9 +47,10 @@
  * control interrupt takes over. */
 #define APP_TEST_MODE   ((BRINGUP_STAGE >= 5) && (BRINGUP_STAGE <= 7))
 
-/* Stages 8-11 drive a voltage vector (fixed angle, forced spin, the Stage 10
- * alignment steps) and, from Stage 11, voltage-mode FOC. */
-#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 11))
+/* Stages 8-12 drive a voltage vector (fixed angle, forced spin, the Stage 10
+ * alignment steps) and, from Stage 11, voltage-mode FOC (Stage 12 adds the
+ * Id/Iq readings to it). */
+#define APP_VEC_MODE    ((BRINGUP_STAGE >= 8) && (BRINGUP_STAGE <= 12))
 
 /* Main-loop tick: 1 kHz (plan: Timing, interrupts and data sharing). */
 #define APP_TICK_S             0.001f
@@ -321,6 +322,32 @@ typedef enum
  * so w = sqrt 3 x Vq / Ke: 106 rpm per volt of Vq. */
 #define FOC_RPM_PER_VQ        (1.7320508f / MOTOR_KE_V_PER_RAD_S * RAD_S_TO_RPM)
 volatile float g_vq = FOC_VQ_INIT;
+/* Vq from THROTTLE1 instead of g_vq (2026-10-14). Changing g_vq needs a
+ * debugger pause, and a pause while armed stops TIM1 with its outputs off
+ * (DBG_TIM1_STOP: "as if MOE was reset", RM0440 29.3.34) and stops the
+ * encoder reads in the control interrupt; the coasting rotor then moves
+ * more than the jump limit before the next read, the interrupt rejects the
+ * sample and disarms (FAULT_ENCODER). The pot changes Vq without a pause.
+ * Mapping: mid-travel = 0, ends = -/+FOC_VQ_MAX, with a dead band around
+ * the middle. Arming needs the pot inside the dead band (zero command). */
+volatile uint32_t g_vq_pot = 1U;
+#define FOC_POT_MID_PERMILLE  500.0f
+#define FOC_POT_DEADBAND      0.05f    /* +/-5 % of half travel around the middle */
+#endif
+
+#if BRINGUP_STAGE >= 12
+/* Stage 12 (plan): Id/Iq telemetry. g_cap_dq = 1: the capture buffer
+ * (g_app_cmd 6, 7) records Id, Iq and the electrical angle instead of the
+ * raw ADC counts; 0: raw counts as before. */
+volatile uint32_t g_cap_dq = 1U;
+/* Capture during FOC without a debugger pause (a pause while armed disarms):
+ * set g_cap_auto_ms before arming; that long after the FOC arm the capture
+ * is re-armed, triggered 60 ms later (after 1024 fresh samples, 51 ms) and
+ * dumped automatically when full. 0 = off. One capture per arm. */
+volatile uint32_t g_cap_auto_ms = 0U;
+#define DQ_CAP_REFILL_MS  60U
+#define DQ_CAP_LABEL   "Id+32768 Iq+32768 in mA, theta_e 0-65535 per elec turn"
+#define DQ_RAW_LABEL   "counts A B C"
 #endif
 #endif
 
@@ -356,6 +383,11 @@ static bool     s_foc_on;           /* armed in FOC mode */
 static float    s_vq_applied;       /* ramped Vq, V */
 static int32_t  s_foc_pos0;         /* encoder position at the last FOC log */
 static uint32_t s_vm_max_mv;        /* highest VM since the last FOC log */
+#endif
+#if BRINGUP_STAGE >= 12
+static uint32_t s_foc_ms;           /* ms since the FOC arm */
+static uint32_t s_cap_auto_at;      /* auto-capture time for this arm, 0 = none */
+static bool     s_cap_auto_dump;    /* dump when the auto capture is full */
 #endif
 static float    s_tr_sum;           /* TRACK statistics over the log period */
 static float    s_tr_min;
@@ -1573,8 +1605,26 @@ static void track_tick(void)
 #if BRINGUP_STAGE >= 11
 /* ---- Stage 11: voltage-mode FOC ---- */
 
+/* THROTTLE1 position as a Vq command (0 inside the dead band). */
+static float foc_pot_vq(void)
+{
+  float x = ((float)aux_throttle_permille(0U) - FOC_POT_MID_PERMILLE) / FOC_POT_MID_PERMILLE;
+  float m = (x < 0.0f) ? -x : x;
+  if (m <= FOC_POT_DEADBAND)
+  {
+    return 0.0f;
+  }
+  m = (m - FOC_POT_DEADBAND) / (1.0f - FOC_POT_DEADBAND);
+  m = (m > 1.0f) ? 1.0f : m;
+  return ((x < 0.0f) ? -m : m) * FOC_VQ_MAX;
+}
+
 static float foc_vq_target(void)
 {
+  if (g_vq_pot != 0U)
+  {
+    return foc_pot_vq();
+  }
   float v = g_vq;
   if (!(v >= -FOC_VQ_MAX) || !(v <= FOC_VQ_MAX))   /* NaN or beyond the limit */
   {
@@ -1592,6 +1642,14 @@ static void foc_arm(void)
     debug_log("FOC arm refused: CORDIC not running (CubeMX: activate CORDIC)");
     return;
   }
+  if ((g_vq_pot != 0U) && (foc_pot_vq() != 0.0f))
+  {
+    debug_log("FOC arm refused: THROTTLE1 not at the middle (%lu permille; dead band %lu-%lu)",
+              aux_throttle_permille(0U),
+              (uint32_t)(FOC_POT_MID_PERMILLE * (1.0f - FOC_POT_DEADBAND)),
+              (uint32_t)(FOC_POT_MID_PERMILLE * (1.0f + FOC_POT_DEADBAND)));
+    return;
+  }
   s_vq_applied = 0.0f;                     /* zero command, then ramp */
   ctrl_set_vq(0.0f);
   ctrl_hold_angle(false);
@@ -1603,8 +1661,14 @@ static void foc_arm(void)
     s_foc_on = true;
     s_foc_pos0 = vec_enc_position();
     s_vm_max_mv = 0U;
-    debug_log("FOC armed: Vd 0, Vq 0 -> %s V at 1 V/s, encoder angle, trip %lu mA",
-              fmt2(b, sizeof(b), foc_vq_target()), (uint32_t)(s_trip_applied * 1000.0f));
+#if BRINGUP_STAGE >= 12
+    s_foc_ms = 0U;
+    s_cap_auto_at = g_cap_auto_ms;
+    s_cap_auto_dump = false;
+#endif
+    debug_log("FOC armed: Vd 0, Vq from %s (now %s V), ramp 1 V/s, trip %lu mA. Don't pause the debugger while armed",
+              (g_vq_pot != 0U) ? "THROTTLE1" : "g_vq", fmt2(b, sizeof(b), foc_vq_target()),
+              (uint32_t)(s_trip_applied * 1000.0f));
   }
   else
   {
@@ -1629,7 +1693,27 @@ static void foc_tick(uint32_t now_ms)
     }
     s_vq_applied += d;
     ctrl_set_vq(s_vq_applied);
+#if BRINGUP_STAGE >= 12
+    s_foc_ms++;
+    if ((s_cap_auto_at != 0U) && (s_foc_ms == s_cap_auto_at))
+    {
+      (void)debug_capture_rearm();
+    }
+    else if ((s_cap_auto_at != 0U) && (s_foc_ms == (s_cap_auto_at + DQ_CAP_REFILL_MS)))
+    {
+      debug_capture_trigger();
+      s_cap_auto_dump = true;
+      debug_log("CAP auto-triggered %lu ms after the FOC arm; dump follows", s_foc_ms);
+    }
+#endif
   }
+#if BRINGUP_STAGE >= 12
+  if (s_cap_auto_dump && debug_capture_done())
+  {
+    s_cap_auto_dump = false;
+    (void)debug_capture_dump_start();
+  }
+#endif
 
   if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))
   {
@@ -1662,6 +1746,32 @@ static void foc_tick(uint32_t now_ms)
     ctrl_set_vq(0.0f);
     ctrl_set_foc(false);
     debug_log("FOC off: disarmed");
+  }
+}
+#endif
+
+#if BRINGUP_STAGE >= 12
+/* Once a second: Id and Iq over the last second (mean, min, max). Steady DC
+ * with little spread = the angle and transforms are right; ripple at the
+ * electrical frequency would show as a wide min-max. */
+static void dq_tick(uint32_t now_ms)
+{
+  static uint32_t s_cap_mode = 2U;      /* forces the first label update */
+  uint32_t mode = (g_cap_dq != 0U) ? 1U : 0U;
+  if (mode != s_cap_mode)
+  {
+    s_cap_mode = mode;
+    ctrl_capture_dq(mode != 0U);
+    debug_capture_label((mode != 0U) ? DQ_CAP_LABEL : DQ_RAW_LABEL);
+  }
+  if (!COMMS_TEST && ((now_ms % VEC_LOG_PERIOD_MS) == 0U))
+  {
+    ctrl_dq_stats_t st;
+    ctrl_dq_stats(&st);
+    debug_log("DQ id=%ld iq=%ld mA (id %ld..%ld, iq %ld..%ld) n=%lu bad=%lu",
+              (long)(st.id_mean * AMPS_TO_MA), (long)(st.iq_mean * AMPS_TO_MA),
+              (long)(st.id_min * AMPS_TO_MA), (long)(st.id_max * AMPS_TO_MA),
+              (long)(st.iq_min * AMPS_TO_MA), (long)(st.iq_max * AMPS_TO_MA), st.n, st.bad);
   }
 }
 #endif
@@ -1787,6 +1897,9 @@ static void vec_tick(uint32_t now_ms)
     vec_command(cmd);
   }
 
+#if BRINGUP_STAGE >= 12
+  dq_tick(now_ms);
+#endif
 #if BRINGUP_STAGE >= 11
   if (ctrl_take_enc_event())
   {
@@ -2281,7 +2394,11 @@ void app_init(void)
   debug_log("STAGE10 g_app_cmd = 9: encoder alignment at g_vec_v (disarmed first); TRACK line while spinning");
 #endif
 #if BRINGUP_STAGE >= 11
-  debug_log("STAGE11 g_app_cmd = 10: voltage-mode FOC (Vd 0), g_vq (V, +/-2, ramped 1 V/s); encoder read in the ISR");
+  debug_log("STAGE11 g_app_cmd = 10: voltage-mode FOC (Vd 0), Vq from THROTTLE1 (g_vq_pot = 1; middle = 0, ends = +/-2 V)");
+  debug_log("STAGE11 or g_vq_pot = 0: Vq = g_vq (V, +/-2). Ramp 1 V/s. Pausing while armed disarms (encoder jump)");
+#endif
+#if BRINGUP_STAGE >= 12
+  debug_log("STAGE12 DQ line every second; g_cap_dq = 1: capture (6, 7) holds Id, Iq, theta_e");
 #endif
 #endif
 #endif

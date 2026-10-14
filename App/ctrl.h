@@ -15,8 +15,9 @@
 #include <stdint.h>
 
 /** Called by the control interrupt with the phase currents (A, positive
- *  into the motor). Register access only. */
-void ctrl_isr(const float amps[PHASE_COUNT]);
+ *  into the motor) and the raw ADC counts (for the capture buffer).
+ *  Register access only. */
+void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHASE_COUNT]);
 
 /** Overcurrent trip level, A. Clamped to [MOTOR_OC_TRIP_MIN_A,
  *  MOTOR_OC_TRIP_STAGE_MAX_A]; NaN gives the default. Returns the level
@@ -55,6 +56,26 @@ void ctrl_hold_angle(bool hold);
 void ctrl_set_foc(bool on);
 void ctrl_set_vq(float vq);
 bool ctrl_take_enc_event(void);
+
+/** Stage 12 rotating-frame currents (A), accumulated by the interrupt since
+ *  the last call: mean, min, max of every sample with a valid encoder
+ *  angle; n samples, bad = samples without one. Resets the statistics.
+ *  capture_dq: true = the capture buffer records Id, Iq (mA + 32768) and
+ *  the electrical angle (0..65535 per turn) instead of raw counts. Main
+ *  loop. */
+typedef struct
+{
+  float id_mean;
+  float iq_mean;
+  float id_min;
+  float id_max;
+  float iq_min;
+  float iq_max;
+  uint32_t n;
+  uint32_t bad;
+} ctrl_dq_stats_t;
+void ctrl_dq_stats(ctrl_dq_stats_t *out);
+void ctrl_capture_dq(bool dq);
 
 /** Phase voltages last commanded (V, before injection) and the highest
  *  duty, for logging. */

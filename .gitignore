@@ -1,3 +1,9 @@
 build
 mx.scratch
 !.settings
+
+# Local firmware walkthrough
+/docs/Firmware-Walkthrough.md
+
+# Per-machine debugger environment; see docs/Debug-Setup.md
+/.vscode/debug-env.local.ps1

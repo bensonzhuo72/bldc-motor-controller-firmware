@@ -186,7 +186,7 @@ The board has three layers of protection: the bench supply and power-path hardwa
 | DRV configuration readback | Registers lost to a reset or glitch | Mismatch → fault, disarm | Stage 4 |
 | Encoder faults | CRC errors, magnet too weak or strong, loss of track, impossible angle jumps | Disarm, motor coasts | Stage 9 |
 | Control-loop heartbeat | The control interrupt stops running (lost ADC trigger, stuck code) | Main loop sees no new count within a few ms → disarm | Stage 7 |
-| I²t thermal limit | Motor overheating at more than 0.65 A for too long | Iq limit pulled back from 4 A toward 0.65 A | Stage 14 |
+| I²t thermal limit | Motor overheating at more than the verified continuous current for too long | Derate total current magnitude sqrt(Id² + Iq²), including field-weakening Id; the original 0.65 A assumption must be reconciled with the 0.55 A reference before thermal validation | Stage 14; field-weakening extension below |
 | Stall detection | Large Iq with no rotation | Disarm, fault logged | Stage 15 |
 | VM overvoltage trip | Braking energy pumping VM up (the bench supply can't absorb it) | VM above about 16 V → coast | Stage 14 |
 | Independent watchdog | Firmware hang or lock-up | MCU reset; boot leaves the gates off | Stage 15 |
@@ -458,15 +458,26 @@ The motor first spins open loop at Stage 9 and first runs under FOC at Stage 11.
 
 ### Stage 12: Rotating-frame current readings (shadow mode)
 
-- **Under test:** Clarke and Park transforms and current signs. Current is measured but not yet controlled.
-- **Connected:** as in Stage 11.
-- **Firmware added:**
-  - Clarke and Park transforms computing Id and Iq while voltage-mode FOC runs.
-  - Id/Iq telemetry over SWO and into the capture buffer.
+**Revised 2026-10-15:** split into 12A (existing baseline) and 12B (remaining hardware checkout). These are development/validation labels; firmware still uses `BRINGUP_STAGE 12`. Current is measured but not yet regulated. Existing ±2 V Vq, 1.5 A nominal phase trip, and 93% duty limits stay unchanged.
+
+#### Stage 12A: Existing implementation and recorded evidence
+
+- Preserve all work already present through Stage 12: prior-stage modules/protections, measured motor parameters and encoder alignment, voltage-mode FOC, pot control, split encoder transfer, Clarke/Park shadow currents, statistics, and raw/dq automatic capture.
+- Identify the exact baseline revision when branch work is authorized. Proposed branch: `stage/12a-existing-baseline`.
+- Preserve previously reported passes, board identity, and explicit waivers. The independent phase-current meter check remains waived, not performed. Stage 12 dq hardware acceptance is still pending; “existing baseline” is not a new hardware pass.
+
+#### Stage 12B: Finish hardware checkouts before Stage 13
+
+- Proposed branch: `stage/12b-hardware-checkout`, based on 12A. No current PI or outer-loop implementation belongs in this checkout scope. Diagnostic fixes require their own implementation authorization and affected rechecks.
 - **Procedure:**
-  1. Run at a constant Vq.
-  2. Slow the rotor by hand to add load.
-- **Pass:** Iq is positive in the driving direction and rises with load. Id stays near 0. Id and Iq look like steady DC, not ripple at the electrical frequency.
+  1. Record tested build/board, boot and driver readback, fresh current offsets, arm/disarm behavior, and applicable prior protection evidence.
+  2. Close the outstanding bridge checks: falling-edge dead time, switch-node-average versus duty, and PWM-on/off supply-current comparison. The nFAULT short test already passed; repeat if relevant changes invalidate that evidence.
+  3. Check current zero with driver awake and valid offsets; verify phase signs/sum/scaling consistency, current sampling window, ADC late counts, capture decoding, and full Stage 12 ISR budget.
+  4. Capture forward/reverse constant-Vq plateaus and bounded load response. Iq should have the appropriate sign and magnitude response; Id should be physically plausible for voltage mode, not required to be exactly zero. Investigate electrical-frequency ripple against angle/current calibration and expected motor behavior. Record speed and VM during Vq reduction to close the outstanding Stage 11 evidence.
+  5. Calibrate the DC-generator housing reaction arm/scale, check electronic-load compliance, and collect C0/C1 baseline evidence from [the characterization plan](Motor-Controller-Characterization-Plan.md) within current limits. If the rig is unsuitable in this envelope, document an explicit alternative or deferral and its effect on acceptance rather than raising limits.
+  6. Close or explicitly disposition auxiliary checkouts (THROTTLE2, UART TX, external CAN, USB orientation/reliability). Resolve the motor continuous-rating discrepancy or document a bounded interim test envelope and the remaining uncertainty. Peripheral deferrals must not be described as completed tests.
+- **Exit gate:** maintain the detailed matrix in [the implementation outline](TEMP-Current-Control-Branch-Plan.md). Every item has evidence/status: pass, fail, previously passed and applicable, waived, or explicitly deferred with rationale and next-stage impact. Required current/angle/PWM/protection failures must be resolved before energized Stage 13 tests. Record the developer's acceptance decision; no acceptance is asserted here.
+- **Parallel development:** Stage 13 software may be implemented on dependent branches while 12B validation is pending. Energized Stage 13 tests and promotion to the validated integration branch wait for 12B acceptance. Later-stage software work does not close this hardware gate.
 
 ### Stage 13: Current-loop FOC (torque mode)
 
@@ -488,12 +499,56 @@ The motor first spins open loop at Stage 9 and first runs under FOC at Stage 11.
 - **Connected:** as in Stage 11, with the limit raised up to 4 A.
 - **Firmware added:**
   - `motor_sm` state machine: IDLE → ALIGN → RUN → FAULT.
-  - Speed PI at 2 kHz that outputs the Iq setpoint, clamped to 4 A peak and reduced toward 0.65 A by the I²t heating model.
+  - Speed PI at 2 kHz that outputs the Iq setpoint, with the planned 4 A peak ceiling and thermal derating toward the verified continuous-current rating (resolve the existing 0.55/0.65 A discrepancy). With nonzero Id, enforce the total-current circle and include both Id and Iq in the I²t heating model; see Stage 14A.
   - Ramp limiter and a hardcoded speed profile.
   - Stop sequence: ramp down, then coast.
   - Software overcurrent trip raised to about 4.5 A (peak line current). VM overvoltage trip: VM\_SENSE above about 16 V makes the motor coast, because deceleration can pump energy back into VM and the bench supply can't absorb it.
 - **Procedure:** run a 100 → 300 → 500 rpm step profile (top no-load speed is about 630 rpm with the duty cap) and tune the speed PI from the captured responses.
 - **Pass:** speed holds within a few rpm, settles without oscillation, and recovers when the shaft is loaded by hand.
+
+### Stage 14A: Field-weakening effect and operating envelope (future extension)
+
+**Status:** planning only, added 2026-10-15 at the developer's request. This is an extension after current-loop and ordinary speed-loop validation, not a new `BRINGUP_STAGE` value. Stage 12 firmware has no field-weakening controller. Its existing ±2 V Vq cap, 1.5 A phase trip, and 93% duty cap are unchanged. The original Stage 14 speed-control pass remains a separate milestone.
+
+**Effect under test.** Negative d-axis current opposes the permanent-magnet flux contribution and can reduce the voltage needed at a given speed, permitting operation above the voltage-limited base speed. It consumes current capacity otherwise available for torque and increases copper heating. It does not increase the available bus voltage or remove the sampling-window duty limit. Encoder magnetic-field status is a separate measurement; MT6701 “field weak” is not a field-weakening command or proof of successful motor flux weakening.
+
+For planning, the steady-state dq model is:
+
+```text
+Vd = R * Id - omega_e * Lq * Iq
+Vq = R * Iq + omega_e * (psi_m + Ld * Id)
+Id² + Iq² <= I_limit²
+sqrt(Vd² + Vq²) <= V_limit <= 0.497 * measured_VM
+```
+
+Use verified electrical rad/s and phase-peak conventions. The measured 0.54 mH is a phase-equivalent estimate, not separate validated Ld/Lq values. Do not substitute the stored line-to-line Ke directly for psi_m without resolving its peak/RMS and mechanical/electrical conventions. The high-resistance, low-inductance gimbal motor may yield only a small useful speed extension at acceptable heating; a measured lack of useful benefit is a valid characterization result.
+
+**Prerequisites before energizing a field-weakening test:**
+
+- Stage 13 current tracking and anti-windup validated; Stage 14 baseline speed control stable with Id reference zero. Stage 12 sign/angle evidence recorded. Confirm that commanded negative Id really produces measured negative Id with the present alignment.
+- Obtain motor-specific allowable negative Id versus temperature and a mechanical speed limit for the motor, magnet attachment, encoder, and load. Resolve the continuous-current rating discrepancy. Until those are established, keep this test at design/model review; do not invent a safe negative-current or overspeed limit from the 4 A peak rating.
+- Resolve or explicitly disposition outstanding bridge/sampling checks. Retain the 93% cap and verify current-sample validity near saturation. Feed measured VM into modulation/voltage headroom calculations; the present hardcoded 12 V normalization is insufficient for this test.
+- Implement and validate a total-current budget, thermal supervision using both Id and Iq, VM overvoltage handling, overspeed protection, and bounded test duration. Record numerical current, negative-Id, speed, temperature, bus-voltage, duration, and current-tracking-error limits before running. A software trip is a backstop, not the commanded current budget.
+- Establish a bus-energy plan for deceleration and loss of weakening at speed. A coasting permanent-magnet motor can still rectify through bridge diodes if its back-EMF exceeds VM; coast alone is not proof against bus overvoltage. Verify the allowed speed/bus envelope or an appropriate energy-absorption path before above-base-speed tests.
+
+**Future firmware/test facilities required:**
+
+- Field weakening disabled by default, explicitly enabled for this test, with bounded/ramped `Id_ref <= 0`, a hard negative-Id limit, and hysteresis or equivalent smooth entry/exit around voltage saturation. No automatic enable after a fault/reset.
+- Limit `|Iq_ref| <= sqrt(max(0, I_limit² - Id_ref²))`; reset/track PI integrators appropriately during saturation, thermal derating, disarm, and mode changes. Confirm the selected d/q voltage allocation actually preserves control of Id under saturation. The current SVPWM scales the vector radially; the plan's d-axis-priority allocation is not yet implemented simply because it is described elsewhere.
+- Log requested and measured Id/Iq, total current, speed request/measured speed, measured VM and its maximum, requested and applied Vd/Vq, voltage utilization, saturation state, phase-current peaks, PWM duty extrema, temperature/thermal estimate, and ISR timing/late samples. Distinguish unsaturated demand from the voltage actually applied.
+- Automatic timed capture and abort, without debugger pauses while armed. Collect matching baseline/weakening captures under equivalent bus voltage, load, and temperature.
+
+**Procedure, once the prerequisites and limits are recorded:**
+
+1. With weakening off and Id reference zero, measure the speed/load curve up to the allowed voltage-limited base speed. Base speed is measured for this bus voltage and load; the existing approximately 630 rpm no-load estimate is not a certified mechanical limit. Identify saturation using requested/applied voltage and current-tracking error, not speed alone.
+2. Below base speed, at a repeatable fixed speed and load, apply small ramped negative-Id steps within the approved envelope. Compare measured Id tracking, required Vq and total voltage magnitude, Iq, supply power, and heating against the zero-Id baseline. Account for R*Id and d/q coupling; do not assume every negative-Id step reduces total voltage magnitude on this motor.
+3. Near the measured voltage limit, compare weakening off/on. Increase speed request only in bounded steps within the established mechanical, electrical, thermal, and bus-energy envelope. Record whether weakening reduces saturation/current error or increases attainable speed under the same voltage and total-current limits, and quantify the lost torque-current headroom.
+4. Exercise entry/exit near base speed, approved load changes, thermal/current derating, and gradual speed reduction. Return Id toward zero as sufficient voltage margin returns; do not abruptly remove weakening while still above the verified zero-Id voltage envelope. Repeat in reverse only after forward tests pass and within the same bounds; negative Id remains negative for both directions.
+5. Return to the baseline operating point at comparable temperature. Check repeatability of current, speed, and a repeatable back-EMF/flux proxy where available. Investigate persistent shifts before further runs; unchanged telemetry alone is not proof that no demagnetization occurred.
+
+**Pass and reporting:** prerequisites and numeric limits documented; correct Id sign/tracking; all current, voltage, duty, thermal, speed, and timing bounds respected; no unstable entry/exit or integrator windup; no unexplained ADC/encoder faults; repeatable baseline after the test. Report effect size and measurement uncertainty: voltage headroom, achievable speed at matched load, available Iq/torque headroom, and loss/heating. If the effect is negligible or the limits prevent a useful extension, record “characterized; not suitable for deployment” rather than increasing limits to force a speed gain. Abort on any predefined bound, sustained current-tracking failure, unexpected bus rise, or loss of angle/sample integrity, using the validated energy-safe response.
+
+**Technical basis:** Microchip's [equation-based flux-weakening description](https://onlinedocs.microchip.com/oxy/GUID-AAAF8F97-D139-4A93-A154-AA3C6EE6BB22-en-US-1/GUID-007091E0-0021-4359-A50B-127AF65C0B1C.html) describes negative-Id operation and the voltage-limit constraint. Its [FOC guidance](https://onlinedocs.microchip.com/oxy/GUID-AAAF8F97-D139-4A93-A154-AA3C6EE6BB22-en-US-1/GUID-7BCD7B7E-3FB2-4218-834C-310CDB3A24BE.html) identifies mechanical damage and magnet demagnetization as limits requiring motor-manufacturer specifications. These support the principle, not qualification of this particular 4015 motor. The test sequence above is a proposed board-specific validation plan, not a reported result.
 
 ### Stage 15: Hardening
 
@@ -505,6 +560,14 @@ The motor first spins open loop at Stage 9 and first runs under FOC at Stage 11.
   - MOTOR\_EN dropping while running makes the motor coast and resets the state machine.
 - **Procedure:** while running, pull the encoder connector, turn SW1 off, stall the shaft and force a watchdog reset.
 - **Pass:** every case stops the motor safely and is logged, with no uncontrolled behavior.
+
+- **Field-weakening extension:** if Stage 14A is implemented, first validate saturation/negative-Id clamping, overspeed/overtemperature responses, enable loss, and encoder-loss response in simulation or a low-energy setup. Extend to the approved weakened-speed envelope only after validating bus energy handling. Confirm faults cannot auto-restart weakening, stale negative-Id commands do not survive reset/re-arm, and shutdown does not exceed the measured VM limit. Record this separately from the ordinary Id=0 hardening results.
+
+## Motor/controller characterization with a generator load
+
+Use [Motor-Controller-Characterization-Plan.md](Motor-Controller-Characterization-Plan.md) alongside Stages 12–14 for the proposed DC-generator/electronic-load test rig. The generator housing is free to rotate about its shaft axis and a housing-mounted rod reacts against a scale, nominally holding the housing still (developer clarification, 2026-10-15). Steady reaction torque is `T = (m_loaded - m_tare) * g * r_perp` for mass-reading scales; shaft power is `P = T * 2*pi*rpm/60`. Calibrate the fixture and account for support friction, wire torque, and coupling/measurement boundaries.
+
+The linked plan defines calibration and generator compliance checks, voltage-mode baseline tests, loaded current-loop acceptance, fixed-speed torque/efficiency maps, future telemetry, uncertainty, and the relevant physics equations. Constant generator current approximates constant electromagnetic braking torque only while the load regulates; it is not a direct calibrated torque measurement. This passive rig cannot impose controlled static load at zero speed. Current limits and stage acceptance remain as recorded; no implementation or measurement is established by this addition.
 
 ## Firmware conventions
 
@@ -604,10 +667,14 @@ All modules live outside the CubeMX "USER CODE" sections, so regenerating the pr
 - [ ] Stage 8: current readings confirmed against a multimeter before the trip is raised above 1 A. (**Deferred by the developer, 2026-10-08**; trip stays at 1.0 A through Stage 9–10.)
 - [x] **Waived by the developer 2026-10-14** (see Bring-up log): ~~Stage 11 (blocks it): the deferred Stage 8 current check~~ — DC ammeter in series with phase A, or the voltmeter method (V_AB across MOTA–MOTB at 0°, Ia = V_AB ÷ 3.3 Ω), within 5 % of the logged Ia. Needed before the trip goes to 3 A.
 - [ ] Stage 13: inductance measured and current-loop gains recomputed from the measured R and L.
+- [ ] Stage 14A: current/speed loops validated; manufacturer-supported negative-Id/temperature and mechanical-speed bounds recorded; continuous-current discrepancy resolved.
+- [ ] Stage 14A: measured-VM modulation, total-current/thermal limits, sampling near saturation, and bus-energy-safe exit/fault response validated before weakened-speed tests.
 
 ## Bring-up log
 
 Dated record of findings, decisions and measured results, newest last. Each entry names the stage it affects. When an entry changes a fact, the section above that holds the fact is updated too.
+
+**Standing recording preference (2026-10-15):** when the developer supplies a substantive bring-up update in chat, save it here and refresh `Firmware-Development-Handoff.md` when current state changes. Use: date/stage; board and firmware settings if known; observation and evidence source; measurements with units; outcome (reported pass, partial, fail, untested, or waived); decisions; remaining checks/next step. Mark missing details as not provided. Keep hypotheses distinct from measurements and preserve corrections chronologically. See repository `AGENTS.md` for the cross-chat recording workflow.
 
 ### 2026-10-04: document and schematic review (before Stage 0)
 
@@ -1045,3 +1112,93 @@ Dated record of findings, decisions and measured results, newest last. Each entr
 - **Id, Iq:** amplitude-invariant Clarke with all three currents and Park as in Firmware conventions (Iq = peak phase current), every interrupt with a valid encoder angle, armed or not and in every output mode (vector, forced spin, FOC). Angle advanced by 55 µs of speed: the encoder sample is one period older than the currents plus the MT6701 propagation delay. Not used for control (shadow mode).
 - **Telemetry:** `DQ id= iq= mA (id min..max, iq min..max) n= bad=` every second (mean, min, max of all samples in the second). `g_cap_dq = 1` (default): the capture buffer records Id + 32768 and Iq + 32768 (mA) and θe (0–65535 per electrical turn); 0 restores raw counts. `g_cap_auto_ms` (set before arming FOC): capture re-armed that long after the arm, triggered 60 ms later and dumped automatically, so no debugger pause is needed while armed.
 - **Expected:** disarmed: Id, Iq ≈ 0. FOC at constant Vq, no load: Iq small and positive for positive Vq (friction), Id ≈ (ωL/R) × Iq ≈ 6 % of Iq at 210 rpm (voltage mode with Vd = 0), narrow min–max. Load by hand: Iq rises toward (Vq − back-EMF)/R (0.45 A at Vq = 1 V stalled), Id stays near 0. Negative Vq: Iq negative.
+
+### 2026-10-15: Field-weakening test-plan extension (documentation only)
+
+**Developer/requester: Nathaniel Su.** Recorded by the Codex agent from this conversation; no new hardware test result.
+
+- **Developer request:** add the field-weakening effect to the test plans. Added Stage 14A as a future extension after current-loop and baseline speed-loop validation, without renumbering the 0–15 bring-up stages or changing `BRINGUP_STAGE`.
+- **Coverage:** negative-Id effect, measured voltage-limited base speed, matched baseline/weakening comparisons, speed versus torque-current headroom, heating, entry/exit, reverse operation, and repeatability. Added prerequisites and Stage 15 fault/exit coverage.
+- **Dependencies made explicit:** motor-specific negative-Id/temperature and mechanical-speed limits, resolution of the continuous-current rating, measured-VM modulation, total-current/thermal budgeting, valid sampling near saturation, and bus energy handling on deceleration or loss of weakening. No suitable negative-Id or overspeed limit has been established for this motor in this entry.
+- **Sources:** current source and recorded board parameters; Microchip equation-based flux-weakening and FOC guidance linked in Stage 14A. Test steps are proposed validation, not measurements. Thermal wording now accounts for Id² + Iq² rather than only Iq when weakening is active.
+- **Unchanged:** Stage 12 selected; voltage-mode FOC/shadow dq measurement only; current ±2 V Vq, 1.5 A trip, and 93% duty limits. No firmware implementation, build, flashing, or bench test performed. Development handoff updated to preserve this context.
+
+### 2026-10-15: Current-control staging and branch-workflow proposal
+
+**Developer/requester: Nathaniel Su.** Recorded by the Codex agent from this conversation.
+
+- **User request:** outline current-control next steps before torque/speed/position modes, allow later implementation on separate branches while prerequisite hardware validation is pending, and save the outline in a separate temporary Markdown document. No code requested.
+- **Artifact:** `TEMP-Current-Control-Branch-Plan.md` proposes Stage 12 validation followed by 13A foundations, 13B PI calculation, 13C limited standstill Id tests, 13D dq regulation, and 13E current-loop acceptance. Includes stacked branches, exact tested-build records, dependency fixes, and hardware-gated promotion.
+- **Status:** proposal for user review, not an adopted stage-number change or assertion that the current main branch is hardware-accepted. No branches/PRs created, firmware changed, or tests performed. Current operating limits remain unchanged. Handoff links the proposal for future agents.
+
+### 2026-10-15: Motor/controller characterization rig and equations
+
+**Developer/setup source: Nathaniel Su.** The load-rig description and housing clarification below were supplied by Nathaniel and documented by the Codex agent.
+
+- **Developer request:** add characterization details using a shaft-coupled DC motor feeding an electronic load in constant-current mode, with a glued housing-mounted rod on a scale to measure torque. **Clarification:** the generator housing is free to rotate and the rod/scale reaction nominally holds it stationary. This is a reaction-torque arrangement; it is not a rod on the rotating shaft or a rigidly mounted housing.
+- **Documentation:** added `Motor-Controller-Characterization-Plan.md`, linked from this plan, the temporary implementation/branch outline, and the development handoff. Covers fixture calibration, measurement uncertainty, generator load compliance, staged torque/current/speed/efficiency mapping, telemetry/evidence, and physics equations.
+- **Pending setup details:** generator construction/model (PM brushed is an explicit modeling assumption), scale/load ratings and resolution, arm geometry/support friction, attachment validation, and numeric test limits. CC regulation and static-load limitations are recorded. No calibration, torque result, hardware pass, firmware change, or operating-limit increase is claimed.
+
+### 2026-10-15: Stage 12 split into existing baseline and checkout closure
+
+**Developer/requester: Nathaniel Su.** Recorded by the Codex agent from this conversation.
+
+- **Developer request:** 12A for everything already done; 12B for the remaining hardware checkouts before Stage 13. Revised the active stage specification, temporary implementation/branch outline, characterization integration, and handoff.
+- **12A:** existing implementation through Stage 12 plus recorded historical evidence. It is not a retroactive Stage 12 hardware pass. Proposed branch `stage/12a-existing-baseline`.
+- **12B:** outstanding bridge/current/encoder/dq/timing checks, voltage-mode load-rig baseline, inherited Stage 11 evidence, and explicit disposition of peripheral/rating issues. Proposed branch `stage/12b-hardware-checkout`. The existing current-meter waiver remains a waiver.
+- **Gate:** later software development may proceed on dependent branches; energized Stage 13 testing and validated integration await 12B acceptance. The earlier single `stage/12-dq-validation` proposal is superseded.
+- **No implementation action:** no branches created, no firmware setting/code changed, no build/flash/test, and no new pass or limit change.
+
+### 2026-10-15: Session developer attribution
+
+- **Nathaniel Su requested** that contributions from this current agent session identify him as the developer. Added attribution to the four agent-created reference documents, this session's dated log entries, and persistent `AGENTS.md` guidance.
+- **Scope:** Nathaniel's requests, decisions, and setup reports in this conversation; Codex remains the writer of the generated documentation. Original plan credit and earlier contributors' bench-report provenance remain unchanged. No historical test result is newly claimed as Nathaniel's measurement.
+
+### 2026-10-16: Main-branch CMake setup investigation
+
+- **Developer/report source: Nathaniel Su.** Reported CMake is not working on `main`, separate from his development branch; exact command and error output not provided. Affects build setup for the existing baseline; no board/motor test settings or measurements supplied.
+- **Agent inspection:** checkout reports `main`; referenced application/generated sources, include directories, startup assembly, and linker script are present. Presets select Ninja and the ARM GCC toolchain. This agent's PowerShell environment resolves `cmake.exe` but does not resolve `ninja`, `arm-none-eabi-gcc`, `arm-none-eabi-g++`, `cube`, or `cube-cmake`; `CUBE_BUNDLE_PATH` is unset. Editor settings select `cube-cmake`. These observations establish unavailable commands in this shell, not absence of installations or the editor's environment.
+- **Assessment/open check:** tool discovery/setup is the leading explanation; request the actual CMake output to establish the user's failure. Open the firmware repository itself as the source root and use its Debug/Release preset with the required tools available. No configure/build, flashing, hardware testing, or firmware/configuration edit performed; no stage acceptance changed.
+
+### 2026-10-16: Ninja discovery failure confirmed
+
+- **Nathaniel Su supplied the CMake error:** `CMake was unable to find a build program corresponding to "Ninja". CMAKE_MAKE_PROGRAM is not set.` Configuration stopped incomplete. This confirms failure to discover Ninja; no hardware result is involved.
+- **Agent filesystem inspection:** Ninja is installed at `C:/Users/natha/AppData/Local/stm32cube/bundles/ninja/1.13.2+st.1/bin/ninja.exe`, with another copy in STM32CubeIDE's plugins. The missing command is an environment/discovery problem, not a missing repository file or absent Ninja installation. Use the installed bundle's bin directory in the configuring process's PATH, or explicitly set CMAKE_MAKE_PROGRAM. No configure/build performed; successful configuration remains unverified.
+
+### 2026-10-16: Debug configuration succeeds
+
+- **Evidence supplied by Nathaniel Su:** CMake output identifies GNU C/C++ 14.3.1 and the ARM GCC assembler, reports `Configuring done` and `Generating done`, and writes build files to `C:/Users/natha/Firmware/BLDC/bldc-motor-controller-firmware/build/Debug`.
+- **Outcome:** the reported Ninja/tool-discovery blocker is resolved for this configuration run. Firmware compilation/linking, flashing, and hardware operation are not established by this output. Next build check is `cmake --build --preset Debug` from the repository in the configured tool environment. No agent build or hardware test performed; no stage acceptance changed.
+
+### 2026-10-16: Linker memory report and RWX warning
+
+- **Nathaniel Su supplied linker output:** `Motor_Controller.elf has a LOAD segment with RWX permissions`; RAM 20,776 B / 112 KB (18.12%), FLASH 121,396 B / 512 KB (23.15%). No fatal error appears in the supplied excerpt; full command exit status was not supplied.
+- **Agent inspection:** `STM32G491XX_FLASH.ld` collects executable `.RamFunc` inputs together with writable initialized data in `.data`. The generated `build/Debug/Motor_Controller.map` confirms RAM functions from debug, encoder, PWM, current sensing, control, and FOC math at RAM addresses within that section. This explains the read/write/execute segment warning and matches the intentional SRAM execution optimization. No linker-script or firmware change made, and no build/flash/hardware test run by the agent. Memory figures describe link-time allocation, not measured runtime stack usage; no bench pass inferred.
+
+### 2026-10-16: Configure-button Makefile report
+
+- **Nathaniel Su reports:** pressing "stm32cubemx configure" says "makefile not foud". App/button identity and verbatim diagnostic remain pending clarification.
+- **Agent inspection:** `Motor_Controller.ioc` selects `ProjectManager.TargetToolchain=CMake`; CMake presets select Ninja. A Makefile is therefore not the expected output of this configuration. A different build action or project selection is a hypothesis, not yet a confirmed cause. No configuration or firmware edits, regeneration, build, or hardware tests performed.
+
+### 2026-10-16: Configure-button extension identified
+
+- **Nathaniel Su's screenshot:** VS Code reports `Configuration failed. Makefile not found!` after the `STM32CubeMX - Configure` action. Evidence attachment: `C:/Users/natha/AppData/Local/Temp/codex-clipboard-3889381c-8020-45c2-9c1d-0d307999d4ea.png` (temporary local attachment, not a repository artifact).
+- **Confirmed cause by installed-code inspection:** `travnsam.vscode-stm32cube-configurator-0.0.1` owns this status-bar button. Its `out/extension.js` checks for a workspace-root `/Makefile` and emits this exact error if absent. Its package description says it generates `c_cpp_properties.json` from CubeMX Makefiles for IntelliSense. It is not the CMake configure action and does not match this Ninja project. The earlier `.cproject` hypothesis is superseded for this error.
+- **Guidance:** disable this extension for the workspace or leave its button unused; retain CMake/Ninja and the working terminal commands. No extension settings, build files, firmware, or hardware changed. The screenshot also shows a separate GDB connection reset; no successful debugging or flashing inferred.
+
+### 2026-10-16: Portable debugger configuration
+
+- **Nathaniel Su's evidence/request:** screenshot shows GDB/nm ENOENT under `C:/Users/benso`; requested a computer-independent launch.json. The hardcoded GDB path was in `.vscode/launch.json`, not CMake. Screenshot: `C:/Users/natha/AppData/Local/Temp/codex-clipboard-cb55c463-4c5b-481f-a5d8-d79ebb8799c5.png` (temporary attachment).
+- **Agent changes:** replaced tool/SVD/script paths with BLDC environment variables; armToolchainPath selects the complete GCC tool bin directory including GDB, nm, and objdump. Prepared a gitignored `.vscode/debug-env.local.ps1` with local paths and added `docs/Debug-Setup.md` for per-computer setup. Shared launch contains no fixed user or tool-installation paths.
+- **Validation:** JSON parses; all seven required local executable/script/SVD paths exist. No debugger launch, build, flash, or hardware test performed. Developer must fully exit VS Code and start it from the configured environment; successful debug launch remains pending.
+
+### 2026-10-16: Debugger environment not resolved
+
+- **Nathaniel Su's screenshot:** Cortex-Debug reports bare `arm-none-eabi-gdb.exe` not found after the portable launch change. Evidence: `C:/Users/natha/AppData/Local/Temp/codex-clipboard-950f6569-fdb8-4bb8-83ce-c190dff1336f.png` (temporary attachment).
+- **Inspection/assessment:** local GDB still exists and the local setup script supplies its bin directory. The bare executable diagnostic indicates the launch's environment-based toolchain directory is not reaching Cortex-Debug; the VS Code process environment was not directly inspected. Reopen VS Code from an external PowerShell session after dot-sourcing the local setup script, with all prior VS Code windows closed. No additional compiler directory is needed; debugging remains unverified.
+
+### 2026-10-16: PATH-based debug setup verified
+
+- **Nathaniel Su requested:** complete step 5 onward of the PATH setup where possible. Removed serverpath and armToolchainPath from `.vscode/launch.json`; Cortex-Debug now uses its PATH/user-setting discovery. Retained BLDC_OPENOCD_SCRIPTS and BLDC_SVD; updated `docs/Debug-Setup.md`. The old local setup script is no longer required.
+- **Agent verification:** inspected saved Windows machine/user PATH and found all six requested executables (GCC, GDB, nm, objdump, Ninja, OpenOCD). Saved user variables resolve to existing SVD and OpenOCD directories; both required OpenOCD scripts exist. Launch JSON parses and the Debug ELF exists. These checks inspect saved settings and files, not the running VS Code environment or target operation.
+- **Next:** developer fully closes/reopens VS Code to inherit settings, then tries the debug launch. No editor process terminated, build/flash/debug session started, or hardware result claimed by the agent.

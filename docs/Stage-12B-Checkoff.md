@@ -96,6 +96,28 @@ Test or explicitly defer below; a deferral is not a pass.
 
 Fatal HardFault/NMI halt/blink behavior remains separate and unchanged.
 
+## UART diagnostics branch regression
+
+Added 2026-10-16 for the authorized UART feature on `post-12b-uartdev`; not a claim of Stage 12B acceptance. Follow [UART-Diagnostics.md](UART-Diagnostics.md) for commands, limits and test instructions.
+
+- [ ] Host protocol tests build and pass.
+- [ ] Target builds with diagnostics enabled; boot reports DIAG USART2 OK.
+- [ ] PA2 TX / PA3 RX work both ways at 115200 8N1: help, ping, status and stats respond.
+- [ ] Existing normal SWO output is mirrored as LOG records; logs 0/1 affects UART only.
+- [ ] UART command numbers use the existing guarded paths; queued/refused/successful actions are distinguished.
+- [ ] Overcurrent, fault latch/clear, zero-command arm, disarm and LED behavior still work through UART commands.
+- [ ] Vq/current limits and pot/manual source-change restrictions reject invalid settings.
+- [ ] Fragmented/CRLF input works; malformed, overlong, timed-out and corrupted/overflowed lines do not execute partial commands.
+- [ ] RX resynchronizes after a blank LF; fresh complete commands work afterward.
+- [ ] TX overload drops complete records and increments counters without blocking control or main-loop supervision.
+- [ ] Stream on/off works; congestion skips samples without catch-up bursts; timestamps/sequence gaps visible.
+- [ ] Dashboard field units, encoder-rpm sign, current validity and cached dq age match the reference logs.
+- [ ] Capture dump completeness checked by sample indexes; loss detected rather than treated as a complete capture.
+- [ ] Continuous RX/TX, capture output and stalled/absent SWO viewer keep the full control ISR below 25 us with no unexplained ADC late samples.
+- [ ] Main-loop command/stop response and memory/stack usage are acceptable under the same stress test.
+- [ ] Buffered input older than 250 ms and partial lines idle for over 1 s are discarded after a stall/reconnect; fresh commands work after LF resynchronization. Disconnect alone does not stop the motor.
+- [ ] Diagnostics-disabled build retains legacy UART testing; simultaneous UART owners are rejected at build time.
+
 ## Final checkoff
 
 - [ ] Continuous-rating discrepancy resolved, or bounded interim test envelope explicitly accepted.

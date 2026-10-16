@@ -24,9 +24,12 @@
 /** Start the cycle counter and DAC3. Returns false if the DAC failed. */
 bool debug_init(void);
 
-/** printf-style log line over SWO (ITM port 0); a newline is appended.
+/** printf-style log line queued to SWO and mirrored to UART diagnostics.
+ *  Whole lines may be dropped under load; a newline is appended.
  *  Main loop only. Integers only: newlib-nano printf has no float support. */
 void debug_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void debug_poll(void);       /* main loop: bounded, nonblocking SWO drain */
+uint32_t debug_log_drops(void);
 
 /** Capture buffer (Stage 7 onward). push: control interrupt, every sample.
  *  trigger: keeps 512 samples before it, records 512 after, then freezes.

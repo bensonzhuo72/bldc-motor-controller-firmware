@@ -25,6 +25,7 @@
 #include "debug.h"
 #include "app_config.h"
 #include "comms_test.h"
+#include "diag_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -226,7 +227,10 @@ void TIM1_BRK_TIM15_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
   /* USER CODE BEGIN USART2_IRQn 0 */
-
+#if UART_DIAG_ENABLE
+  diag_uart_irq();
+  return;
+#endif
   /* USER CODE END USART2_IRQn 0 */
   HAL_UART_IRQHandler(&huart2);
   /* USER CODE BEGIN USART2_IRQn 1 */

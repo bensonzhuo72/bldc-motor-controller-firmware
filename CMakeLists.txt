@@ -47,6 +47,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     App/app.c
     App/debug.c
+    App/diag_uart.c
+    App/diag.c
     App/mt6701.c
     App/power.c
     App/drv8323.c
@@ -64,7 +66,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Bring-up log 2026-10-08, Stage 7). The rest stays at -O0 for debugging.
 # Source options come after CMAKE_C_FLAGS_DEBUG on the command line, so -O2 wins.
 # mt6701.c joined at Stage 11: the encoder is read in the control interrupt.
-set_source_files_properties(App/cursense.c App/pwm.c App/debug.c App/ctrl.c App/foc_math.c App/mt6701.c
+# Keep byte-moving IRQ/protocol work inexpensive too; USART2 stays lower priority.
+set_source_files_properties(App/cursense.c App/pwm.c App/debug.c App/ctrl.c App/foc_math.c App/mt6701.c App/diag_uart.c App/diag.c
     PROPERTIES COMPILE_OPTIONS "-O2")
 
 # Add include paths

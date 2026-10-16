@@ -30,6 +30,13 @@
 #define COMMS_TEST_CAN  0
 #define COMMS_TEST_USB  1
 
+/* Standalone diagnostics owns USART2 instead of the legacy UART bench test.
+ * Existing CubeMX setup: PA2 TX / PA3 RX, 115200 8N1, IRQ priority 6. */
+#define UART_DIAG_ENABLE 1
+#if UART_DIAG_ENABLE && COMMS_TEST && COMMS_TEST_UART
+#error "USART2 has two owners: disable UART_DIAG_ENABLE or COMMS_TEST_UART"
+#endif
+
 /* Throttle pots and supply-current sensor test (aux_sense.c): logs both
  * pots and the ACS71240 supply current every 250 ms. The module itself runs
  * from Stage 2 regardless; this switch only adds the log lines. */

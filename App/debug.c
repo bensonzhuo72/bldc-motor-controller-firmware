@@ -5,11 +5,39 @@
 #include "debug.h"
 #include "app_config.h"
 #include "dac.h"
+#include "diag.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 /* One log line, including the appended newline; longer lines are truncated. */
 #define DEBUG_LOG_LINE_MAX  128U
+
+/* Main-only SWO queue. Do not wait on ITM readiness in normal operation;
+ * a stalled viewer must not stall motor supervision (UART request, 2026-10-16). */
+#define DEBUG_SWO_SIZE 1024U
+#define DEBUG_SWO_BUDGET 64U
+static char s_swo[DEBUG_SWO_SIZE];
+static uint32_t s_swo_head, s_swo_tail, s_swo_drops;
+
+uint32_t debug_log_drops(void) { return s_swo_drops; }
+
+void debug_poll(void)
+{
+  if (((ITM->TCR & ITM_TCR_ITMENA_Msk) == 0U) || ((ITM->TER & 1U) == 0U))
+  {
+    s_swo_tail = s_swo_head;
+    return;
+  }
+  for (uint32_t i = 0U; i < DEBUG_SWO_BUDGET && s_swo_tail != s_swo_head; i++)
+  {
+    /* CMSIS ITM_SendChar uses this readiness test but then busy-waits.
+     * We yield immediately and retry on another main-loop pass. */
+    if (ITM->PORT[0U].u32 == 0U) { break; }
+    ITM->PORT[0U].u8 = (uint8_t)s_swo[s_swo_tail & (DEBUG_SWO_SIZE - 1U)];
+    s_swo_tail++;
+  }
+}
 
 /* Fault-loop LED half period in busy-wait iterations (a few Hz at -O0;
  * DWT may not be running if the fault came before debug_init()). */
@@ -47,8 +75,18 @@ void debug_log(const char *fmt, ...)
   (void)vsnprintf(line, sizeof(line) - 1U, fmt, args);
   va_end(args);
 
-  debug_put_str(line);
-  (void)ITM_SendChar('\n');
+  size_t len = strlen(line);
+  diag_log(line, len);
+  if (len + 1U <= DEBUG_SWO_SIZE - (s_swo_head - s_swo_tail))
+  {
+    for (size_t i = 0U; i < len; i++)
+    {
+      s_swo[s_swo_head++ & (DEBUG_SWO_SIZE - 1U)] = line[i];
+    }
+    s_swo[s_swo_head++ & (DEBUG_SWO_SIZE - 1U)] = '\n';
+  }
+  else { s_swo_drops++; }
+  debug_poll();
 }
 
 /* ---- Capture buffer ------------------------------------------------------- */

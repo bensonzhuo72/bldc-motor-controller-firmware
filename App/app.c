@@ -6,6 +6,7 @@
 #include "app_config.h"
 #include "board.h"
 #include "debug.h"
+#include "diag.h"
 #if BRINGUP_STAGE >= 1
 #include "mt6701.h"
 #endif
@@ -38,6 +39,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifndef BRINGUP_STAGE
 #error "BRINGUP_STAGE must be defined in app_config.h"
@@ -352,6 +354,9 @@ volatile uint32_t g_cap_dq = 1U;
  * is re-armed, triggered 60 ms later (after 1024 fresh samples, 51 ms) and
  * dumped automatically when full. 0 = off. One capture per arm. */
 volatile uint32_t g_cap_auto_ms = 0U;
+/* Main-loop cache: dashboards must not reset ctrl_dq_stats accumulators. */
+static ctrl_dq_stats_t s_diag_dq;
+static uint32_t s_diag_dq_ms;
 #define DQ_CAP_REFILL_MS  60U
 #define DQ_CAP_LABEL   "Id+32768 Iq+32768 in mA, theta_e 0-65535; 0 0 = invalid"
 #define DQ_RAW_LABEL   "counts A B C"
@@ -1808,6 +1813,8 @@ static void dq_tick(uint32_t now_ms)
   {
     ctrl_dq_stats_t st;
     ctrl_dq_stats(&st);
+    s_diag_dq = st;
+    s_diag_dq_ms = HAL_GetTick();
     debug_log("DQ id=%ld iq=%ld mA (id %ld..%ld, iq %ld..%ld) n=%lu bad=%lu",
               (long)(st.id_mean * AMPS_TO_MA), (long)(st.iq_mean * AMPS_TO_MA),
               (long)(st.id_min * AMPS_TO_MA), (long)(st.id_max * AMPS_TO_MA),
@@ -2347,14 +2354,199 @@ void app_clock_init(void)
   SET_BIT(CRS->CR, CRS_CR_AUTOTRIMEN);
 }
 
+/* ---- Diagnostic application adapter ------------------------------------- */
+/* Numeric commands retain debugger g_app_cmd meanings. UART command 0 is an
+ * explicit fault-clear request. Acceptance means queued, not successfully armed. */
+static const char *app_diag_command(uint32_t command)
+{
+#if BRINGUP_STAGE >= 4
+  if (command == 0U)
+  {
+#if BRINGUP_STAGE >= 5
+    if (pwm_is_armed() || g_app_cmd != APP_CMD_NONE) { return "disarm first"; }
+#endif
+    g_fault_clear_request = 1U;
+    return NULL;
+  }
+#endif
+#if APP_TEST_MODE || APP_VEC_MODE
+  bool supported = command == APP_CMD_ARM || command == APP_CMD_DISARM || command == APP_CMD_SW_BREAK;
+#if BRINGUP_STAGE >= 7
+  supported = supported || command == APP_CMD_CAPTURE || command == APP_CMD_DUMP;
+#endif
+#if APP_BRIDGE_TOOLS
+  supported = supported || command == APP_CMD_SWEEP || command == APP_CMD_IDRIVE;
+#endif
+#if BRINGUP_STAGE == 8
+  supported = supported || command == APP_CMD_LSTEP;
+#endif
+#if APP_VEC_MODE && BRINGUP_STAGE >= 10
+  supported = supported || command == APP_CMD_ALIGN;
+#endif
+#if APP_VEC_MODE && BRINGUP_STAGE >= 11
+  supported = supported || command == APP_CMD_FOC;
+#endif
+  if (!supported) { return "command unavailable at this stage"; }
+  /* Stop can replace a pending command; everything else must wait. */
+  if (g_app_cmd != APP_CMD_NONE && command != APP_CMD_DISARM) { return "command busy"; }
+  if (g_fault_clear_request && command != APP_CMD_DISARM) { return "clear pending"; }
+  g_app_cmd = command;
+  return NULL;
+#else
+  (void)command;
+  return "command unavailable at this stage";
+#endif
+}
+
+static const char *app_diag_set(const char *name, int32_t value)
+{
+  /* Explicit allowlist and integer engineering units; never arbitrary memory
+   * writes. Existing control setters retain their independent clamps/ramps. */
+#if BRINGUP_STAGE >= 5
+  if (g_app_cmd != APP_CMD_NONE || g_fault_clear_request) { return "command pending"; }
+#endif
+#if APP_VEC_MODE
+  if (strcmp(name, "oc_ma") == 0)
+  {
+    if (value < (int32_t)(MOTOR_OC_TRIP_MIN_A * 1000.0f) ||
+        value > (int32_t)(MOTOR_OC_TRIP_STAGE_MAX_A * 1000.0f)) { return "oc_ma range"; }
+    g_oc_trip = (float)value * 0.001f;
+    return NULL;
+  }
+  if (strcmp(name, "vec_mv") == 0)
+  {
+    if (value < 0 || value > (int32_t)(VEC_V_MAX * 1000.0f)) { return "vec_mv range"; }
+    g_vec_v = (float)value * 0.001f;
+    return NULL;
+  }
+#if BRINGUP_STAGE >= 9
+  if (strcmp(name, "spin_mhz") == 0)
+  {
+    if (value < -(int32_t)(SPIN_HZ_MAX * 1000.0f) ||
+        value > (int32_t)(SPIN_HZ_MAX * 1000.0f)) { return "spin_mhz range"; }
+    g_spin_hz = (float)value * 0.001f;
+    return NULL;
+  }
+#endif
+#if BRINGUP_STAGE >= 11
+  if (strcmp(name, "vq_mv") == 0)
+  {
+    if (g_vq_pot != 0U) { return "select vq_pot=0 while disarmed first"; }
+    if (value < -(int32_t)(FOC_VQ_MAX * 1000.0f) ||
+        value > (int32_t)(FOC_VQ_MAX * 1000.0f)) { return "vq_mv range"; }
+    g_vq = (float)value * 0.001f;
+    return NULL;
+  }
+  if (strcmp(name, "vq_pot") == 0)
+  {
+    if (pwm_is_armed()) { return "disarm before source change"; }
+    if (value != 0 && value != 1) { return "vq_pot range"; }
+    g_vq = 0.0f;
+    g_vq_pot = (uint32_t)value;
+    return NULL;
+  }
+#endif
+#if BRINGUP_STAGE >= 12
+  if (strcmp(name, "cap_dq") == 0)
+  {
+    /* Format switching can mix ring history/labels. Keep it a boot-time
+     * debugger setting until capture has a format-aware reset interface. */
+    return "capture format is boot-time debugger setting";
+  }
+  if (strcmp(name, "cap_auto_ms") == 0)
+  {
+    if (pwm_is_armed()) { return "disarm before capture schedule change"; }
+    if (value < 0 || value > 60000) { return "cap_auto_ms range"; }
+    g_cap_auto_ms = (uint32_t)value;
+    return NULL;
+  }
+#endif
+#endif
+  (void)name;
+  (void)value;
+  return "unknown setting for this stage";
+}
+
+static void app_diag_snapshot(char *out, size_t size)
+{
+  uint32_t armed = 0U, fault = 0U, vm = 0U, valid = 0U;
+  int32_t rpm = 0, ia = 0, ib = 0, ic = 0, id = 0, iq = 0;
+  uint32_t dq_n = 0U, dq_age = 0U;
+  int32_t vq = 0, vq_target = 0, trip = 0;
+  uint32_t pot = 0U;
+#if BRINGUP_STAGE >= 5
+  armed = pwm_is_armed() ? 1U : 0U;
+#endif
+#if BRINGUP_STAGE >= 4
+  fault = (uint32_t)fault_first();
+#endif
+#if BRINGUP_STAGE >= 2
+  vm = power_vm_mv();
+#endif
+#if BRINGUP_STAGE >= 1
+  mt6701_snapshot_t enc;
+  mt6701_snapshot(&enc);
+  rpm = (int32_t)(enc.speed_rad_s * RAD_S_TO_RPM); /* signed encoder mechanical rpm */
+  if (enc.healthy) { valid |= 1U; }
+#endif
+#if BRINGUP_STAGE >= 7
+  cursense_snapshot_t cur;
+  cursense_snapshot(&cur);
+  ia = (int32_t)(cur.amps[PHASE_A] * 1000.0f);
+  ib = (int32_t)(cur.amps[PHASE_B] * 1000.0f);
+  ic = (int32_t)(cur.amps[PHASE_C] * 1000.0f);
+  if (cursense_offsets_valid() && drv8323_is_configured()) { valid |= 2U; }
+#endif
+#if APP_VEC_MODE && BRINGUP_STAGE >= 12
+  id = (int32_t)(s_diag_dq.id_mean * 1000.0f);
+  iq = (int32_t)(s_diag_dq.iq_mean * 1000.0f);
+  dq_n = s_diag_dq.n;
+  dq_age = HAL_GetTick() - s_diag_dq_ms;
+#endif
+#if APP_VEC_MODE
+  trip = (int32_t)(s_trip_applied * 1000.0f);
+#if BRINGUP_STAGE >= 11
+  vq = (int32_t)(s_vq_applied * 1000.0f);
+  vq_target = (int32_t)(foc_vq_target() * 1000.0f);
+  pot = g_vq_pot;
+#endif
+#endif
+  /* Cached one-second dq means, not a new/reset stats read or 100 Hz samples.
+   * Other fields are individually coherent snapshots, not simultaneous. */
+  int n = snprintf(out, size,
+      "stage=%u armed=%lu fault=%lu vm_mv=%lu rpm=%ld valid=%lu ia_ma=%ld ib_ma=%ld ic_ma=%ld id_ma=%ld iq_ma=%ld dq_n=%lu dq_age_ms=%lu vq_mv=%ld vq_target_mv=%ld pot=%lu trip_ma=%ld swo_drop=%lu",
+      (unsigned)BRINGUP_STAGE, (unsigned long)armed, (unsigned long)fault,
+      (unsigned long)vm, (long)rpm, (unsigned long)valid,
+      (long)ia, (long)ib, (long)ic, (long)id, (long)iq,
+      (unsigned long)dq_n, (unsigned long)dq_age, (long)vq, (long)vq_target,
+      (unsigned long)pot, (long)trip, (unsigned long)debug_log_drops());
+  if (n < 0 || (size_t)n >= size)
+  {
+    (void)snprintf(out, size, "snapshot_error=truncated");
+  }
+}
+
+static const diag_ops_t s_diag_ops =
+{
+  .command = app_diag_command,
+  .set = app_diag_set,
+  .snapshot = app_diag_snapshot,
+};
+
 void app_init(void)
 {
   /* Safe pins first, before anything is logged. */
   board_safe_pins();
 
   bool debug_ok = debug_init();
+  bool diag_ok = diag_init(&s_diag_ops);
 
   debug_log("BOOT stage=%d", BRINGUP_STAGE);
+#if UART_DIAG_ENABLE
+  debug_log("DIAG USART2 115200 8N1 %s; protocol v1, send help + LF", diag_ok ? "OK" : "CONFIG FAIL");
+#else
+  (void)diag_ok;
+#endif
 #if BRINGUP_STAGE >= 2
   debug_log_reset_cause();
 #endif
@@ -2521,4 +2713,8 @@ void app_loop(void)
 #endif
     }
   }
+  /* Service diagnostics only after due control/supervision tasks. No replay
+   * of missed telemetry intervals; UART bytes are moved by a low-priority IRQ. */
+  diag_poll(HAL_GetTick());
+  debug_poll();
 }

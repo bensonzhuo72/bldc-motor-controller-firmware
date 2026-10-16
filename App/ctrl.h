@@ -25,7 +25,8 @@ void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHASE_COUNT]);
 float ctrl_set_trip(float amps);
 
 /** True once after the interrupt tripped on overcurrent (it has already
- *  disarmed and triggered the capture); *phase and *amps say where. */
+ *  disarmed, latched the fault and triggered the capture); *phase and *amps
+ *  say where. Consuming this diagnostic event does not clear the fault. */
 bool ctrl_take_oc_event(uint32_t *phase, float *amps);
 
 /** Stage 8: voltage vector command, phase-voltage amplitude v (V) at
@@ -59,7 +60,9 @@ bool ctrl_take_enc_event(void);
 
 /** Stage 12 rotating-frame currents (A), accumulated by the interrupt since
  *  the last call: mean, min, max of every sample with a valid encoder
- *  angle; n samples, bad = samples without one. Resets the statistics.
+ *  angle, enabled driver and valid offsets; n accepted samples, bad = rejected
+ *  samples. n=0 means no valid measurement, not verified zero current.
+ *  Resets the statistics.
  *  capture_dq: true = the capture buffer records Id, Iq (mA + 32768) and
  *  the electrical angle (0..65535 per turn) instead of raw counts. Main
  *  loop. */

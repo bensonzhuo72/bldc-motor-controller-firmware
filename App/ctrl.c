@@ -7,6 +7,8 @@
 #include "motor_params.h"
 #include "pwm.h"
 #include "debug.h"
+#include "fault.h"
+#include "cursense.h"
 #include "main.h"
 #if BRINGUP_STAGE >= 8
 #include "foc_math.h"
@@ -87,21 +89,22 @@ static volatile float    s_dq_max_id;
 static volatile float    s_dq_min_iq;
 static volatile float    s_dq_max_iq;
 static volatile uint32_t s_dq_n;
-static volatile uint32_t s_dq_bad;     /* interrupts without a valid angle */
+static volatile uint32_t s_dq_bad;     /* invalid angle or current acquisition */
 
 /* ---- Control interrupt ---------------------------------------------------- */
 
-APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
+#if BRINGUP_STAGE >= 8
+/* Shutdown precedes encoder/math work. Trigger the capture after pushing
+ * this sample, preserving the existing trigger boundary convention. */
+APP_RAMFUNC static bool ctrl_check_overcurrent(const float amps[PHASE_COUNT])
 {
   if (!pwm_is_armed())
   {
-    return;
+    return false;
   }
-
-#if BRINGUP_STAGE >= 8
   /* Software overcurrent trip (plan: Firmware protection, Stage 8): any
    * phase beyond the level disarms within this 50 us cycle. The fault is
-   * raised by the main loop; the capture keeps the lead-up. */
+   * latched here so drv_tick cannot wake the driver before ctrl_tick. */
   float trip = s_trip_a;
   for (uint32_t ph = 0U; ph < PHASE_COUNT; ph++)
   {
@@ -109,14 +112,26 @@ APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
     if ((a > trip) || (a < -trip))
     {
       motor_disarm();
-      debug_capture_trigger();
+      (void)fault_raise(FAULT_OVERCURRENT, ph, (uint32_t)(int32_t)(a * 1000.0f));
       s_oc_phase = ph;
       s_oc_amps = a;
       s_oc_event = true;
-      return;
+      return true;
     }
   }
+  return false;
+}
+#endif
 
+APP_RAMFUNC static void ctrl_step(const float amps[PHASE_COUNT])
+{
+  (void)amps;
+  if (!pwm_is_armed())
+  {
+    return;
+  }
+
+#if BRINGUP_STAGE >= 8
   if (s_step_pending)
   {
     s_v = s_step_v;
@@ -237,10 +252,12 @@ APP_RAMFUNC static void ctrl_enc_angle(void)
 
 #if BRINGUP_STAGE >= 12
 /* Id, Iq from this interrupt's currents and the encoder angle; statistics
- * for the main loop. False (and nothing computed) without a valid angle. */
-APP_RAMFUNC static bool ctrl_dq(const float amps[PHASE_COUNT], float *id, float *iq, float *th)
+ * for the main loop. A sleeping CSA or uncalibrated offset is not a valid
+ * zero-current measurement (Stage 12B checkout prerequisites). */
+APP_RAMFUNC static bool ctrl_dq(const float amps[PHASE_COUNT], bool current_valid,
+                               float *id, float *iq, float *th)
 {
-  if (!s_th_ok)
+  if (!s_th_ok || !current_valid)
   {
     s_dq_bad++;
     return false;
@@ -281,7 +298,7 @@ APP_RAMFUNC static uint16_t ctrl_cap_ma(float a)
 #endif
 
 /* Called by the control interrupt. From Stage 11 the encoder is read here:
- * finish the read started last time (so the angle is fresh for this step),
+ * check overcurrent first, then finish the read started last time,
  * compute the angle (and from Stage 12 Id, Iq), record the capture sample,
  * run the step, then start the next read whatever the step did (armed or
  * not, trip or not), so the encoder keeps updating while disarmed. The
@@ -289,6 +306,15 @@ APP_RAMFUNC static uint16_t ctrl_cap_ma(float a)
  * lands after this interrupt's sample (debug.h). */
 APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHASE_COUNT])
 {
+#if BRINGUP_STAGE >= 12
+  /* Save acquisition validity before a trip lowers ENABLE, so the trip's
+   * own sample remains available in dq capture; later samples are invalid. */
+  bool current_valid = cursense_offsets_valid() &&
+      ((BOARD_DRV_ENABLE_PORT->ODR & BOARD_DRV_ENABLE_PIN) != 0U);
+#endif
+#if BRINGUP_STAGE >= 8
+  bool oc = ctrl_check_overcurrent(amps);
+#endif
 #if BRINGUP_STAGE >= 11
   mt6701_isr_collect();
   ctrl_enc_angle();
@@ -297,7 +323,7 @@ APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHAS
   float id = 0.0f;
   float iq = 0.0f;
   float th = 0.0f;
-  bool dq_ok = ctrl_dq(amps, &id, &iq, &th);
+  bool dq_ok = ctrl_dq(amps, current_valid, &id, &iq, &th);
   if (s_cap_dq)
   {
     float t = th * CTRL_CAP_ANGLE_SCALE;
@@ -309,6 +335,12 @@ APP_RAMFUNC void ctrl_isr(const float amps[PHASE_COUNT], const uint16_t raw[PHAS
   {
     debug_capture_push(raw[PHASE_A], raw[PHASE_B], raw[PHASE_C]);
   }
+#if BRINGUP_STAGE >= 8
+  if (oc)
+  {
+    debug_capture_trigger();
+  }
+#endif
   ctrl_step(amps);
 #if BRINGUP_STAGE >= 11
   mt6701_isr_start();
@@ -414,17 +446,20 @@ void ctrl_dq_stats(ctrl_dq_stats_t *out)
   uint32_t n = s_dq_n;
   out->n = n;
   out->bad = s_dq_bad;
-  out->id_mean = (n > 0U) ? (s_dq_sum_id / (float)n) : 0.0f;
-  out->iq_mean = (n > 0U) ? (s_dq_sum_iq / (float)n) : 0.0f;
-  out->id_min = s_dq_min_id;
-  out->id_max = s_dq_max_id;
-  out->iq_min = s_dq_min_iq;
-  out->iq_max = s_dq_max_iq;
+  float sum_id = s_dq_sum_id;
+  float sum_iq = s_dq_sum_iq;
+  out->id_min = (n > 0U) ? s_dq_min_id : 0.0f;
+  out->id_max = (n > 0U) ? s_dq_max_id : 0.0f;
+  out->iq_min = (n > 0U) ? s_dq_min_iq : 0.0f;
+  out->iq_max = (n > 0U) ? s_dq_max_iq : 0.0f;
   s_dq_sum_id = 0.0f;
   s_dq_sum_iq = 0.0f;
   s_dq_n = 0U;
   s_dq_bad = 0U;
   __set_PRIMASK(primask);
+  /* Divisions need not delay the 20 kHz interrupt. */
+  out->id_mean = (n > 0U) ? (sum_id / (float)n) : 0.0f;
+  out->iq_mean = (n > 0U) ? (sum_iq / (float)n) : 0.0f;
 }
 
 bool ctrl_take_enc_event(void)

@@ -1,16 +1,18 @@
 # Firmware development handoff and bring-up record
 
-Snapshot: 2026-10-15. This document preserves context for future developers and agents. It is separate from the owner's local `Firmware-Walkthrough.md`, which explains how the code works and is gitignored.
+Snapshot: 2026-10-16. This document preserves context for future developers and agents. It is separate from the owner's local `Firmware-Walkthrough.md`, which explains how the code works and is gitignored.
 
 **Developer for this session: Nathaniel Su.** Requests, decisions, and setup clarifications originating in this agent's 2026-10-15 conversation are Nathaniel's; documentation was written by the Codex agent. Earlier bench history summarized here retains its original provenance and is not retroactively attributed to Nathaniel. Use his name for subsequent updates from this conversation, as requested.
 
 ## Current task boundary
 
-The user's current request is **documentation only; no firmware code changes now**. This handoff describes future work but does not authorize implementing another stage, changing limits, building, flashing, or running the motor. The documentation turn did not build, flash, or test hardware.
+Nathaniel Su authorized **Stage 12B implementation/protection fixes on 2026-10-16** and explicitly confirmed **12B only**, excluding Stage 13 current regulation. The agent hardened overcurrent fault latching and shadow-current diagnostics; no limits, stage selection, or generated configuration changed. Source reviewed only; builds, flashing and hardware testing remain with the developer under `CLAUDE.md`. Stage 12B hardware acceptance is still pending.
 
 Read the user's latest instructions before taking action. Historical approvals below describe decisions already made; they are not blanket authorization for new bench procedures or later stages.
 
 ## Read first and source precedence
+
+**Feature checkoff policy (Nathaniel Su, 2026-10-16):** every implemented feature or behavior change must update the relevant short tick-box tests and affected regressions in the same turn. Start with `docs/Stage-12B-Checkoff.md`; link separate stage checklists there when later-stage work is authorized. Preserve prior passes/waivers and leave new or invalidated checks pending. Repository `AGENTS.md` contains the persistent instruction.
 
 **Ongoing update policy (user request, 2026-10-15):** substantive future bring-up reports are saved in the original plan's dated Bring-up log during the reporting turn, and this handoff is refreshed when current state changes. Repository `AGENTS.md` supplies the persistent instructions for future chats. Record provenance, measurements, decisions, missing evidence, and unresolved checks; never convert an inference or waiver into a verified bench pass. The personal walkthrough remains separate and ignored. Shared files are local until explicitly committed/synchronized; separate checkouts may be stale.
 
@@ -37,6 +39,7 @@ This handoff is a dated summary, not a replacement specification. Current source
 - No Stage 12 bench pass appears in the inspected final log entry.
 - Stage 12 is now organized as **12A: existing baseline and recorded evidence**, and **12B: remaining hardware checkout before Stage 13** (user request, 2026-10-15). These are planning labels, not changes to the numeric firmware macro. Proposed branches are `stage/12a-existing-baseline` then `stage/12b-hardware-checkout`; neither was created. Preserve existing passes/waivers without treating 12A as a newly validated build. See the temporary implementation outline for the 12B closure matrix. Stage 13 software can progress on dependent branches, but energized tests and validated promotion await 12B acceptance.
 - Earlier open-loop spin and electrical-alignment commands remain available at Stage 12.
+- **Status LED update (Nathaniel Su request, 2026-10-16):** Stage 5 onward uses LED4/PC3 for controller status: disarmed/waiting 5 Hz (100 ms on/off), PWM armed solid on, latched fault 1 Hz (500 ms on/off), with fault priority until explicit clear. Waiting includes missing arm prerequisites; solid indicates PWM armed, not shaft motion. Main-loop indication replaces power-state indication in these stages; Stages 0–4 and fatal HardFault/NMI halt/blink diagnostics retain their earlier behavior. Source-reviewed only; build and bench confirmation pending.
 
 Do not advance `BRINGUP_STAGE` to 13 as a substitute for implementing Stage 13. `APP_VEC_MODE` currently ends at Stage 12; changing this macro alone would not create a functional current-loop application.
 
@@ -170,7 +173,9 @@ The continuous motor rating appears as both 0.55 A and 0.65 A in the existing re
 
 ## Runtime integration and invariants to preserve
 
-The fast path is `ADC1_2_IRQHandler -> ctrl_isr -> encoder collect -> electrical angle -> dq/capture -> ctrl_step -> PWM duties -> encoder start`. Sampling occurs once every 50 µs independently of main-loop scheduling. The current trip runs before new output calculation, although Stage 12 dq/capture processing precedes the trip check.
+The fast path is `ADC1_2_IRQHandler -> ctrl_isr -> overcurrent check/shutdown/latch -> encoder collect -> electrical angle -> dq/capture -> ctrl_step -> PWM duties -> encoder start`. Sampling occurs once every 50 µs independently of main-loop scheduling. Since the 2026-10-16 Stage 12B fix, overcurrent shuts down and latches before encoder/dq work; the main loop only consumes the diagnostic event and logs it. This closes the prior window where `drv_tick` could begin waking the driver before `ctrl_tick` latched the fault. Fault context retains phase and signed mA, and capture triggers after the trip sample as before.
+
+Stage 12B dq statistics require an enabled driver, valid calibrated offsets and a valid angle. `bad` now includes failed current prerequisites; `n=0` is unavailable data, not a measured zero. Empty windows return zero extrema; mean divisions run outside the interrupt-disabled snapshot. Capture stores invalid dq as `0 0` (not -32.768 A). Validity is saved before shutdown so the trip sample can still be captured. Raw capture is unaffected. Late ADC completion remains counted but not rejected by this change; Stage 12B must establish clean sampling, and explicit stale-sample handling remains assigned to Stage 13A.
 
 Keep SPI3 and ordinary logging out of this path. The encoder pipeline has only a short CS setup wait; it does not block for the complete transfer. ADC2/3 completion uses a bounded wait. Some older comments say absolutely no waiting; describe the actual bounded mechanisms accurately.
 
@@ -181,6 +186,8 @@ Faults remain latched until explicitly cleared. Re-waking the driver after norma
 Generated peripheral changes belong in CubeMX, not arbitrary edits to generated init code. Keep application hooks in USER CODE blocks. Preserve custom handler ownership to avoid duplicate HardFault/ADC handlers. Keep fast-path optimization and SRAM placement unless measured evidence supports a change.
 
 ## Open checks and known limitations
+
+**Consolidated checkoff (Nathaniel Su request, 2026-10-16):** [Stage-12B-Checkoff.md](Stage-12B-Checkoff.md) lists pending build, protection, bridge, sensing/dq/capture/timing, voltage FOC, load-rig, auxiliary and LED checks. At Nathaniel's follow-up request it now uses short tick-to-pass items, with no mandatory per-test form/status codes; notes and capture links are optional in the checklist. Explicit deferrals remain separate from passes. It preserves prior evidence and waivers; substantive results reported in chat still belong in the original Bring-up log. No new test or stage pass is implied.
 
 **Planned characterization rig (developer, 2026-10-15):** BLDC coupled to a DC generator feeding an electronic load in CC mode. Generator housing is free to rotate; a rod glued to the housing reacts against a scale and nominally holds it stationary. This mounting detail is user-confirmed. See `docs/Motor-Controller-Characterization-Plan.md` for calibration, torque/power/dq equations, efficiency boundaries, load compliance, stage integration, and required evidence. DC generator type/model, scale/load specs, arm geometry, ratings, and measured results are not yet provided. Do not assume constant load-current setpoint guarantees calibrated torque or that this rig can load a stationary position loop. The temporary branch outline links this characterization work; no controller implementation or limits changed.
 

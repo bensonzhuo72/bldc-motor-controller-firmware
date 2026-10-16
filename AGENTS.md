@@ -6,6 +6,16 @@
 - `docs/Firmware-Development-Handoff.md` for current implementation, decisions, measured values, and unresolved checks.
 - The relevant stage and latest Bring-up log entries in `docs/BLDC Controller Firmware Bring-Up Test Plan.md`.
 - Current source before claiming that planned functionality is implemented.
+- `docs/Stage-12B-Checkoff.md` before implementing features or changing behavior that affects its checks.
+
+## Standing user preference: maintain feature checkoffs
+
+Nathaniel Su requested this policy on 2026-10-16: whenever a new feature is implemented or existing firmware behavior changes, update the checkoff document in the same turn without waiting for another request.
+
+- Add or revise short, actionable `- [ ]` items in `docs/Stage-12B-Checkoff.md` for new behavior and affected regression checks. Include a clear expected result and any applicable existing limit. Avoid duplicates and mandatory per-test forms/status codes; the user should only need to tick a box when it passes.
+- Leave new tests unchecked. Implementation or source review does not establish a bench pass. Preserve existing completed checks and waivers; if a change invalidates a prior pass, preserve its history in the canonical Bring-up log and add an unchecked recheck item explaining the affected behavior.
+- Keep stage scope clear. Stage 12B tests belong in the current checklist. When later-stage implementation is explicitly authorized, add/link its own clearly labeled stage checklist from this document rather than silently making later-stage tests prerequisites for 12B.
+- Keep detailed procedures in the original plan or relevant reference document. Record substantive results and reasons for deferral in the canonical Bring-up log; refresh the handoff when status changes. Mention the checklist update in the completion response.
 
 ## Standing user preference: preserve bring-up updates
 

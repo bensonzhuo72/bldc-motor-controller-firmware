@@ -97,11 +97,18 @@
 #define STAGE1_ANGLE_TO_DAC_SHIFT   2U      /* 14-bit angle -> 12-bit DAC */
 #endif
 
-#if BRINGUP_STAGE >= 2
+#if (BRINGUP_STAGE >= 2) && (BRINGUP_STAGE < 5)
 /* LED4 shows the power state (plan Stage 2): NO_VM slow blink (1 Hz),
  * VM_SETTLING fast blink (5 Hz), VM_OK steady on. */
 #define LED_NO_VM_HALF_PERIOD_MS     500UL
 #define LED_SETTLING_HALF_PERIOD_MS  100UL
+#endif
+
+#if BRINGUP_STAGE >= 5
+/* Status LED policy, Nathaniel Su request, 2026-10-16 (plan Stage 12B):
+ * waiting = 5 Hz, armed = solid, latched fault = 1 Hz. */
+#define LED_WAIT_HALF_PERIOD_MS     100UL
+#define LED_FAULT_HALF_PERIOD_MS    500UL
 #endif
 
 #if BRINGUP_STAGE == 2
@@ -346,7 +353,7 @@ volatile uint32_t g_cap_dq = 1U;
  * dumped automatically when full. 0 = off. One capture per arm. */
 volatile uint32_t g_cap_auto_ms = 0U;
 #define DQ_CAP_REFILL_MS  60U
-#define DQ_CAP_LABEL   "Id+32768 Iq+32768 in mA, theta_e 0-65535 per elec turn"
+#define DQ_CAP_LABEL   "Id+32768 Iq+32768 in mA, theta_e 0-65535; 0 0 = invalid"
 #define DQ_RAW_LABEL   "counts A B C"
 #endif
 #endif
@@ -627,7 +634,8 @@ static void power_tick(uint32_t now_ms)
               power_motor_en() ? 1U : 0U, power_vm_mv());
   }
 
-  /* LED4 shows the power state. */
+#if BRINGUP_STAGE < 5
+  /* Earlier power diagnostics retain their original LED pattern. */
   switch (power_state())
   {
     case POWER_VM_OK:
@@ -646,6 +654,36 @@ static void power_tick(uint32_t now_ms)
         HAL_GPIO_TogglePin(BOARD_LED_PORT, BOARD_LED_PIN);
       }
       break;
+  }
+#else
+  (void)now_ms;
+#endif
+}
+#endif
+
+#if BRINGUP_STAGE >= 5
+static void status_led_tick(uint32_t now_ms)
+{
+  static uint32_t previous_half_period = UINT32_MAX;
+  static uint32_t pattern_start_ms;
+  /* Fault takes priority over armed; disarmed includes waiting for power
+   * or other arm prerequisites, not a guarantee that arming is allowed. */
+  uint32_t half_period = fault_active() ? LED_FAULT_HALF_PERIOD_MS :
+                         (pwm_is_armed() ? 0U : LED_WAIT_HALF_PERIOD_MS);
+  if (half_period != previous_half_period)
+  {
+    previous_half_period = half_period;
+    pattern_start_ms = now_ms;
+  }
+  bool on = (half_period == 0U) ||
+            (((now_ms - pattern_start_ms) % (2U * half_period)) < half_period);
+  if (on)
+  {
+    BOARD_LED_PORT->BSRR = BOARD_LED_PIN;
+  }
+  else
+  {
+    BOARD_LED_PORT->BRR = BOARD_LED_PIN;
   }
 }
 #endif
@@ -893,6 +931,9 @@ static void drv_monitor(uint32_t now_ms)
   if (g_fault_clear_request != 0U)
   {
     g_fault_clear_request = 0U;
+#if BRINGUP_STAGE >= 5
+    motor_disarm();   /* clearing never leaves an existing command energized */
+#endif
     debug_log("FAULT cleared by request (was %s, count=%lu)",
               fault_name(fault_first()), fault_count());
     fault_clear();
@@ -1097,11 +1138,10 @@ static void ctrl_tick(uint32_t now_ms)
   float oc_amps;
   if (ctrl_take_oc_event(&oc_phase, &oc_amps))
   {
-    /* The interrupt has already disarmed; latch and log (ctx: phase 0-2 = A-C,
+    /* The interrupt has already disarmed and latched (ctx: phase 0-2 = A-C,
      * current in mA as a signed 32-bit value). */
     debug_log("OVERCURRENT phase %c %ld mA (trip %ld mA): disarmed in the control interrupt",
               (char)('A' + oc_phase), (long)(oc_amps * AMPS_TO_MA), (long)(s_trip_applied * AMPS_TO_MA));
-    (void)fault_raise(FAULT_OVERCURRENT, oc_phase, (uint32_t)(int32_t)(oc_amps * AMPS_TO_MA));
   }
 #endif
 
@@ -2458,6 +2498,10 @@ void app_loop(void)
 #endif
 #if COMMS_TEST
     comms_test_tick(s_last_tick_ms);
+#endif
+#if BRINGUP_STAGE >= 5
+    /* Reflect this tick's arm/disarm commands and fault handling. */
+    status_led_tick(HAL_GetTick());
 #endif
     uint32_t elapsed = debug_cycles() - start;
     if (elapsed > s_task_max_cycles)

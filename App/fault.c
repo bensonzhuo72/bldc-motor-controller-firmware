@@ -7,23 +7,29 @@
 
 volatile uint32_t g_fault_clear_request;
 
-static fault_code_t s_first = FAULT_NONE;
-static uint32_t s_ctx1;
-static uint32_t s_ctx2;
-static uint32_t s_tick_ms;
-static uint32_t s_count;
+static volatile fault_code_t s_first = FAULT_NONE;
+static volatile uint32_t s_ctx1;
+static volatile uint32_t s_ctx2;
+static volatile uint32_t s_tick_ms;
+static volatile uint32_t s_count;
 
 bool fault_raise(fault_code_t code, uint32_t ctx1, uint32_t ctx2)
 {
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
   s_count++;
   if (s_first != FAULT_NONE)
   {
+    __set_PRIMASK(primask);
     return false;
   }
-  s_first = code;
   s_ctx1 = ctx1;
   s_ctx2 = ctx2;
-  s_tick_ms = HAL_GetTick();
+  /* Read the HAL timebase directly: this path is also used by the control
+   * ISR, where HAL calls are prohibited. Publish the code last. */
+  s_tick_ms = uwTick;
+  s_first = code;
+  __set_PRIMASK(primask);
   return true;
 }
 
@@ -39,9 +45,12 @@ fault_code_t fault_first(void)
 
 void fault_first_context(uint32_t *ctx1, uint32_t *ctx2, uint32_t *tick_ms)
 {
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
   *ctx1 = s_ctx1;
   *ctx2 = s_ctx2;
   *tick_ms = s_tick_ms;
+  __set_PRIMASK(primask);
 }
 
 uint32_t fault_count(void)
@@ -51,11 +60,14 @@ uint32_t fault_count(void)
 
 void fault_clear(void)
 {
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
   s_first = FAULT_NONE;
   s_ctx1 = 0U;
   s_ctx2 = 0U;
   s_tick_ms = 0U;
   s_count = 0U;
+  __set_PRIMASK(primask);
 }
 
 const char *fault_name(fault_code_t code)

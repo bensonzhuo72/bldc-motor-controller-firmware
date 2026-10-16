@@ -7,7 +7,7 @@
  *
  * A fault never clears itself. fault_clear() is the only way out, called
  * when the developer sets g_fault_clear_request from the debugger.
- * Main loop only.
+ * Raising and reading faults is interrupt-safe. Clear from main while disarmed.
  */
 #ifndef FAULT_H
 #define FAULT_H
@@ -35,7 +35,8 @@ typedef enum
 } fault_code_t;
 
 /** Latch a fault. The first one is kept with its context; later ones are
- *  counted. Returns true if this call latched the first fault. */
+ *  counted. Returns true if this call latched the first fault. May be called
+ *  from the control ISR: no HAL calls, logging, or driver access. */
 bool fault_raise(fault_code_t code, uint32_t ctx1, uint32_t ctx2);
 
 bool fault_active(void);
